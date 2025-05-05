@@ -5,9 +5,8 @@ import json
 import re
 import os
 import threading
+import queue
 import time
-import uuid
-import redis
 from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
@@ -16,16 +15,11 @@ API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 # ScrapingBee endpoint
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
 
-# Redis connection
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-redis_client = redis.from_url(REDIS_URL)
-
-# Constants
+# In-memory job storage (in production, use Redis or a database)
+jobs = {}
+request_queue = queue.Queue()
 MAX_CONCURRENT_REQUESTS = 5
-QUEUE_KEY = "scraper:queue"
-JOB_PREFIX = "scraper:job:"
-WORKER_LOCK_KEY = "scraper:worker_lock"
-WORKER_LOCK_EXPIRY = 60  # 60 seconds lock expiry
+worker_running = False
 
 def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false'):
     params = {
@@ -216,63 +210,35 @@ def calculate_credits(js_render, premium_proxy):
     else:
         return 1  # Base cost
 
-def get_job(job_id):
-    """Get job data from Redis"""
-    job_key = f"{JOB_PREFIX}{job_id}"
-    job_data = redis_client.get(job_key)
-    
-    if job_data:
-        return json.loads(job_data)
-    return None
-
-def save_job(job_id, job_data):
-    """Save job data to Redis"""
-    job_key = f"{JOB_PREFIX}{job_id}"
-    redis_client.set(job_key, json.dumps(job_data))
-
-def acquire_worker_lock():
-    """Try to acquire the worker lock with expiry"""
-    return redis_client.set(WORKER_LOCK_KEY, "1", ex=WORKER_LOCK_EXPIRY, nx=True)
-
-def release_worker_lock():
-    """Release the worker lock"""
-    redis_client.delete(WORKER_LOCK_KEY)
-
 def worker():
     """Background worker to process queued requests in batches of 5"""
-    print("Worker thread started...")
+    global worker_running
+    worker_running = True
     
-    while True:
+    while worker_running:
         try:
-            # Try to acquire lock to prevent multiple workers across processes
-            if not acquire_worker_lock():
-                # Another worker is already running
-                time.sleep(5)
-                continue
-                
-            # Get job IDs from queue (up to MAX_CONCURRENT_REQUESTS)
+            # Get up to 5 jobs from the queue
             batch = []
             for _ in range(MAX_CONCURRENT_REQUESTS):
-                job_id = redis_client.lpop(QUEUE_KEY)
-                if job_id:
-                    job_id = job_id.decode('utf-8')
-                    job_data = get_job(job_id)
-                    if job_data:
+                try:
+                    job_id = request_queue.get(block=False)
+                    if job_id in jobs:
                         batch.append(job_id)
-                else:
+                    request_queue.task_done()
+                except queue.Empty:
                     break
             
             if not batch:
-                # No jobs, release lock and sleep
-                release_worker_lock()
-                time.sleep(2)
+                time.sleep(1)  # Sleep if no jobs are available
                 continue
             
             # Process the batch with ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=len(batch)) as executor:
                 futures = {
-                    executor.submit(process_job, job_id): job_id 
-                    for job_id in batch
+                    executor.submit(
+                        process_job, 
+                        job_id
+                    ): job_id for job_id in batch
                 }
                 
                 for future in futures:
@@ -280,64 +246,39 @@ def worker():
                         future.result()
                     except Exception as e:
                         job_id = futures[future]
-                        job_data = get_job(job_id)
-                        if job_data:
-                            job_data['status'] = 'error'
-                            job_data['result'] = {"error": str(e)}
-                            job_data['completed_at'] = time.time()
-                            save_job(job_id, job_data)
-            
-            # Release lock when done
-            release_worker_lock()
-            
+                        jobs[job_id]['status'] = 'error'
+                        jobs[job_id]['result'] = {"error": str(e)}
+        
         except Exception as e:
             print(f"Worker error: {str(e)}")
-            # Make sure to release lock if we hit an error
-            release_worker_lock()
-            time.sleep(2)
+            time.sleep(1)
 
 def process_job(job_id):
     """Process a single job"""
     try:
-        job_data = get_job(job_id)
-        if not job_data:
-            return
-            
-        # Update status to processing
-        job_data['status'] = 'processing'
-        save_job(job_id, job_data)
+        job = jobs[job_id]
+        jobs[job_id]['status'] = 'processing'
         
         # Call the scraping function
         result = scrape_complete_homepage(
-            job_data['url'], 
-            job_data['js_render'], 
-            job_data['premium_proxy']
+            job['url'], 
+            job['js_render'], 
+            job['premium_proxy']
         )
         
         # Update job with result
-        job_data['status'] = 'completed'
-        job_data['result'] = result
-        job_data['completed_at'] = time.time()
+        jobs[job_id]['status'] = 'completed'
+        jobs[job_id]['result'] = result
+        jobs[job_id]['completed_at'] = time.time()
         
         # Calculate credits
-        credit_cost = calculate_credits(job_data['js_render'], job_data['premium_proxy'])
-        job_data['credits_used'] = credit_cost
-        
-        # Save updated job
-        save_job(job_id, job_data)
+        credit_cost = calculate_credits(job['js_render'], job['premium_proxy'])
+        jobs[job_id]['credits_used'] = credit_cost
         
     except Exception as e:
-        try:
-            # Try to update job with error
-            job_data = get_job(job_id)
-            if job_data:
-                job_data['status'] = 'error'
-                job_data['result'] = {"error": str(e)}
-                job_data['completed_at'] = time.time()
-                save_job(job_id, job_data)
-        except:
-            # If we can't even update the job, just pass
-            pass
+        jobs[job_id]['status'] = 'error'
+        jobs[job_id]['result'] = {"error": str(e)}
+        jobs[job_id]['completed_at'] = time.time()
 
 @app.route('/api/submit', methods=['GET'])
 def submit_job():
@@ -351,11 +292,11 @@ def submit_job():
         return jsonify({"error": "No URL provided. Use '?url=example.com' parameter"}), 400
         
     if not job_id:
-        # Generate a UUID-based ID if not provided
-        job_id = str(uuid.uuid4())
+        # Generate a timestamp-based ID if not provided
+        job_id = f"job_{int(time.time() * 1000)}"
         
     # Check if job_id already exists
-    if get_job(job_id):
+    if job_id in jobs:
         return jsonify({"error": f"Job ID '{job_id}' already exists. Please use a unique job ID"}), 400
         
     # Add http:// prefix if not present
@@ -363,7 +304,7 @@ def submit_job():
         url = 'https://' + url
     
     # Create a new job
-    job_data = {
+    jobs[job_id] = {
         'url': url,
         'js_render': js_render,
         'premium_proxy': premium_proxy,
@@ -374,11 +315,8 @@ def submit_job():
         'credits_used': calculate_credits(js_render, premium_proxy)
     }
     
-    # Save job to Redis
-    save_job(job_id, job_data)
-    
     # Add to queue
-    redis_client.rpush(QUEUE_KEY, job_id)
+    request_queue.put(job_id)
     
     return jsonify({
         "job_id": job_id,
@@ -395,49 +333,44 @@ def get_job_status():
     if not job_id:
         return jsonify({"error": "No job_id provided. Use '?job_id=YOUR_JOB_ID' parameter"}), 400
         
-    job_data = get_job(job_id)
-    if not job_data:
+    if job_id not in jobs:
         return jsonify({"error": f"Job '{job_id}' not found"}), 404
+        
+    job = jobs[job_id]
     
     # If job is completed, return the result
-    if job_data['status'] == 'completed':
+    if job['status'] == 'completed':
         return jsonify({
             "job_id": job_id,
             "status": "completed",
-            "url": job_data['url'],
-            "submitted_at": job_data['submitted_at'],
-            "completed_at": job_data['completed_at'],
-            "credits_used": job_data['credits_used'],
-            "result": job_data['result']
+            "url": job['url'],
+            "submitted_at": job['submitted_at'],
+            "completed_at": job['completed_at'],
+            "credits_used": job['credits_used'],
+            "result": job['result']
         })
-    elif job_data['status'] == 'error':
+    elif job['status'] == 'error':
         return jsonify({
             "job_id": job_id,
             "status": "error",
-            "url": job_data['url'],
-            "submitted_at": job_data['submitted_at'],
-            "completed_at": job_data['completed_at'],
-            "error": job_data['result']
+            "url": job['url'],
+            "submitted_at": job['submitted_at'],
+            "completed_at": job['completed_at'],
+            "error": job['result']
         })
     else:
         # If job is still queued or processing
         return jsonify({
             "job_id": job_id,
-            "status": job_data['status'],
-            "url": job_data['url'],
-            "submitted_at": job_data['submitted_at'],
+            "status": job['status'],
+            "url": job['url'],
+            "submitted_at": job['submitted_at'],
             "message": "processing..."
         })
 
 @app.route('/api/queue', methods=['GET'])
 def get_queue_status():
     """Get status of all jobs in the queue"""
-    # Get queue size
-    queue_size = redis_client.llen(QUEUE_KEY)
-    
-    # Get all job keys
-    all_job_keys = redis_client.keys(f"{JOB_PREFIX}*")
-    
     # Count jobs by status
     status_counts = {
         'queued': 0,
@@ -446,47 +379,38 @@ def get_queue_status():
         'error': 0
     }
     
-    jobs_summary = {}
-    
-    for key in all_job_keys:
-        job_id = key.decode('utf-8').replace(JOB_PREFIX, '')
-        job_data = get_job(job_id)
-        
-        if job_data:
-            if job_data['status'] in status_counts:
-                status_counts[job_data['status']] += 1
-                
-            jobs_summary[job_id] = {
-                "status": job_data["status"],
-                "url": job_data["url"],
-                "submitted_at": job_data["submitted_at"],
-                "credits_used": job_data.get("credits_used", 0)
-            }
+    for job in jobs.values():
+        if job['status'] in status_counts:
+            status_counts[job['status']] += 1
     
     return jsonify({
-        "queue_size": queue_size,
-        "active_jobs": len(all_job_keys),
+        "queue_size": request_queue.qsize(),
+        "active_jobs": len(jobs),
         "status_counts": status_counts,
-        "jobs": jobs_summary
+        "jobs": {
+            job_id: {
+                "status": job["status"],
+                "url": job["url"],
+                "submitted_at": job["submitted_at"],
+                "credits_used": job.get("credits_used", 0)
+            } for job_id, job in jobs.items()
+        }
     })
 
 @app.route('/api/clear', methods=['GET'])
 def clear_completed():
     """Clear completed and error jobs"""
     count = 0
-    all_job_keys = redis_client.keys(f"{JOB_PREFIX}*")
+    job_ids = list(jobs.keys())  # Create a copy of keys
     
-    for key in all_job_keys:
-        job_id = key.decode('utf-8').replace(JOB_PREFIX, '')
-        job_data = get_job(job_id)
-        
-        if job_data and job_data['status'] in ['completed', 'error']:
-            redis_client.delete(key)
+    for job_id in job_ids:
+        if jobs[job_id]['status'] in ['completed', 'error']:
+            del jobs[job_id]
             count += 1
     
     return jsonify({
         "message": f"Cleared {count} completed/error jobs",
-        "remaining_jobs": len(all_job_keys) - count
+        "remaining_jobs": len(jobs)
     })
 
 @app.route('/api/scrape', methods=['GET'])
@@ -513,27 +437,6 @@ def scrape_api():
         result['credits_used'] = credit_cost
     
     return jsonify(result)
-
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check endpoint for monitoring"""
-    # Check Redis connection
-    try:
-        redis_client.ping()
-        redis_status = "connected"
-    except Exception as e:
-        redis_status = f"error: {str(e)}"
-    
-    # Check if worker is running
-    worker_status = "running" if redis_client.exists(WORKER_LOCK_KEY) else "idle"
-    
-    return jsonify({
-        "status": "healthy",
-        "redis": redis_status,
-        "worker": worker_status,
-        "queue_size": redis_client.llen(QUEUE_KEY),
-        "api_key_configured": bool(API_KEY)
-    })
 
 @app.route('/', methods=['GET'])
 def home():
@@ -662,14 +565,6 @@ def home():
                 <pre>GET /api/scrape?url=example.com&js_render=true&premium_proxy=false</pre>
             </div>
             
-            <div class="endpoint">
-                <h2>6. Health Check</h2>
-                <p>Use the <code>/api/health</code> endpoint to check the health of the service.</p>
-                
-                <h3>Example:</h3>
-                <pre>GET /api/health</pre>
-            </div>
-            
             <h2>Credit Usage:</h2>
             <table>
                 <tr>
@@ -726,11 +621,21 @@ def home():
     </html>
     '''
 
-# Start the worker thread
-worker_thread = threading.Thread(target=worker, daemon=True)
-worker_thread.start()
+# Start the worker thread when the app starts
+worker_thread = None
+
+@app.before_first_request
+def start_worker():
+    global worker_thread
+    if worker_thread is None or not worker_thread.is_alive():
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
 
 if __name__ == '__main__':
+    # Start the worker thread
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+    
     # Run the Flask app
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
