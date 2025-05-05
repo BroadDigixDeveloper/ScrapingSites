@@ -7,20 +7,24 @@ import os
 
 app = Flask(__name__)
 
-# Get ScrapingBee API key from environment variable
 API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
-
 # ScrapingBee endpoint
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
 
-def scrape_complete_homepage(url):
+def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false'):
     params = {
         'api_key': API_KEY,
         'url': url,
-        'render_js': 'true',
-        'premium_proxy': 'true',
         'wait': 5000
     }
+    
+    # Add JavaScript rendering parameter if needed
+    if use_js_render.lower() == 'true':
+        params['render_js'] = 'true'
+    
+    # Add premium proxy parameter if needed
+    if use_premium_proxy.lower() == 'true':
+        params['premium_proxy'] = 'true'
 
     try:
         response = requests.get(SCRAPINGBEE_URL, params=params)
@@ -188,11 +192,15 @@ def scrape_api():
     
     Query parameters:
     - url: The URL to scrape (required)
+    - js_render: Whether to use JavaScript rendering (true/false, default: true)
+    - premium_proxy: Whether to use premium proxy (true/false, default: false)
     
     Returns:
     - JSON response with the scraped data or error message
     """
     url = request.args.get('url')
+    js_render = request.args.get('js_render', 'true')
+    premium_proxy = request.args.get('premium_proxy', 'false')
     
     if not url:
         return jsonify({"error": "No URL provided. Use '?url=example.com' parameter"}), 400
@@ -201,7 +209,22 @@ def scrape_api():
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
     
-    result = scrape_complete_homepage(url)
+    # Calculate estimated credits
+    credit_cost = 1  # Base cost
+    if js_render.lower() == 'true':
+        credit_cost = 5  # Base cost with JS rendering
+    if premium_proxy.lower() == 'true':
+        if js_render.lower() == 'true':
+            credit_cost = 25  # Premium proxy with JS rendering
+        else:
+            credit_cost = 10  # Premium proxy without JS rendering
+    
+    result = scrape_complete_homepage(url, js_render, premium_proxy)
+    
+    # Add credit information to the result
+    if isinstance(result, dict) and not result.get('error'):
+        result['credits_used'] = credit_cost
+    
     return jsonify(result)
 
 @app.route('/', methods=['GET'])
@@ -215,23 +238,97 @@ def home():
                 body { font-family: Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 20px; }
                 code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
                 pre { background: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; }
+                table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                th { background-color: #f4f4f4; }
+                tr:nth-child(even) { background-color: #f9f9f9; }
             </style>
         </head>
         <body>
             <h1>Web Scraper API</h1>
-            <p>Use the API endpoint <code>/api/scrape?url=example.com</code> to scrape a website.</p>
+            <p>Use the API endpoint <code>/api/scrape</code> to scrape a website.</p>
+            
+            <h2>Parameters:</h2>
+            <table>
+                <tr>
+                    <th>Parameter</th>
+                    <th>Description</th>
+                    <th>Default</th>
+                </tr>
+                <tr>
+                    <td>url</td>
+                    <td>The URL to scrape (required)</td>
+                    <td>-</td>
+                </tr>
+                <tr>
+                    <td>js_render</td>
+                    <td>Whether to use JavaScript rendering</td>
+                    <td>true</td>
+                </tr>
+                <tr>
+                    <td>premium_proxy</td>
+                    <td>Whether to use premium proxy</td>
+                    <td>false</td>
+                </tr>
+            </table>
+            
+            <h2>Credit Usage:</h2>
+            <table>
+                <tr>
+                    <th>Configuration</th>
+                    <th>Credits</th>
+                </tr>
+                <tr>
+                    <td>Basic (no JS, no premium proxy)</td>
+                    <td>1</td>
+                </tr>
+                <tr>
+                    <td>With JS rendering</td>
+                    <td>5</td>
+                </tr>
+                <tr>
+                    <td>With premium proxy (no JS)</td>
+                    <td>10</td>
+                </tr>
+                <tr>
+                    <td>With JS rendering + premium proxy</td>
+                    <td>25</td>
+                </tr>
+            </table>
+            
             <h2>Example:</h2>
-            <pre>GET /api/scrape?url=example.com</pre>
+            <pre>GET /api/scrape?url=example.com&js_render=true&premium_proxy=false</pre>
             <p>This will return a JSON object with the scraped website data.</p>
+            
+            <h3>Testing Tool:</h3>
+            <form action="/api/scrape" method="get">
+                <p>
+                    <label for="url">URL to scrape:</label>
+                    <input type="text" id="url" name="url" placeholder="example.com" required style="width: 300px;">
+                </p>
+                <p>
+                    <label for="js_render">Use JavaScript rendering:</label>
+                    <select id="js_render" name="js_render">
+                        <option value="true">Yes (5 credits)</option>
+                        <option value="false">No (1 credit)</option>
+                    </select>
+                </p>
+                <p>
+                    <label for="premium_proxy">Use premium proxy:</label>
+                    <select id="premium_proxy" name="premium_proxy">
+                        <option value="false">No</option>
+                        <option value="true">Yes (increases cost)</option>
+                    </select>
+                </p>
+                <p>
+                    <button type="submit">Scrape Website</button>
+                </p>
+            </form>
         </body>
     </html>
     '''
 
 if __name__ == '__main__':
-    # Check if API key is set
-    if not API_KEY:
-        print("Warning: SCRAPINGBEE_API_KEY environment variable not set")
-    
-    # Run the Flask app - Koyeb sets the PORT environment variable
+    # Run the Flask app
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
