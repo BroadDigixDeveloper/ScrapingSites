@@ -624,12 +624,8 @@ def home():
 # Start the worker thread when the app starts
 worker_thread = None
 
-@app.before_first_request
-def start_worker():
-    global worker_thread
-    if worker_thread is None or not worker_thread.is_alive():
-        worker_thread = threading.Thread(target=worker, daemon=True)
-        worker_thread.start()
+worker_thread = threading.Thread(target=worker, daemon=True)
+worker_thread.start()
 
 if __name__ == '__main__':
     # Start the worker thread
