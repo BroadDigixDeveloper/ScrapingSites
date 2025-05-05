@@ -4,12 +4,22 @@ from bs4 import BeautifulSoup
 import json
 import re
 import os
+import threading
+import queue
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 
 API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 # ScrapingBee endpoint
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
+
+# In-memory job storage (in production, use Redis or a database)
+jobs = {}
+request_queue = queue.Queue()
+MAX_CONCURRENT_REQUESTS = 5
+worker_running = False
 
 def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false'):
     params = {
@@ -185,19 +195,227 @@ def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false
     except Exception as e:
         return {"error": str(e)}
 
+def calculate_credits(js_render, premium_proxy):
+    """Calculate the credit cost based on the configuration"""
+    js = js_render.lower() == 'true'
+    premium = premium_proxy.lower() == 'true'
+    
+    if premium:
+        if js:
+            return 25  # Premium proxy with JS rendering
+        else:
+            return 10  # Premium proxy without JS rendering
+    elif js:
+        return 5  # With JS rendering
+    else:
+        return 1  # Base cost
+
+def worker():
+    """Background worker to process queued requests in batches of 5"""
+    global worker_running
+    worker_running = True
+    
+    while worker_running:
+        try:
+            # Get up to 5 jobs from the queue
+            batch = []
+            for _ in range(MAX_CONCURRENT_REQUESTS):
+                try:
+                    job_id = request_queue.get(block=False)
+                    if job_id in jobs:
+                        batch.append(job_id)
+                    request_queue.task_done()
+                except queue.Empty:
+                    break
+            
+            if not batch:
+                time.sleep(1)  # Sleep if no jobs are available
+                continue
+            
+            # Process the batch with ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = {
+                    executor.submit(
+                        process_job, 
+                        job_id
+                    ): job_id for job_id in batch
+                }
+                
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception as e:
+                        job_id = futures[future]
+                        jobs[job_id]['status'] = 'error'
+                        jobs[job_id]['result'] = {"error": str(e)}
+        
+        except Exception as e:
+            print(f"Worker error: {str(e)}")
+            time.sleep(1)
+
+def process_job(job_id):
+    """Process a single job"""
+    try:
+        job = jobs[job_id]
+        jobs[job_id]['status'] = 'processing'
+        
+        # Call the scraping function
+        result = scrape_complete_homepage(
+            job['url'], 
+            job['js_render'], 
+            job['premium_proxy']
+        )
+        
+        # Update job with result
+        jobs[job_id]['status'] = 'completed'
+        jobs[job_id]['result'] = result
+        jobs[job_id]['completed_at'] = time.time()
+        
+        # Calculate credits
+        credit_cost = calculate_credits(job['js_render'], job['premium_proxy'])
+        jobs[job_id]['credits_used'] = credit_cost
+        
+    except Exception as e:
+        jobs[job_id]['status'] = 'error'
+        jobs[job_id]['result'] = {"error": str(e)}
+        jobs[job_id]['completed_at'] = time.time()
+
+@app.route('/api/submit', methods=['GET'])
+def submit_job():
+    """Submit a new scraping job to the queue"""
+    url = request.args.get('url')
+    js_render = request.args.get('js_render', 'true')
+    premium_proxy = request.args.get('premium_proxy', 'false')
+    job_id = request.args.get('job_id')
+    
+    if not url:
+        return jsonify({"error": "No URL provided. Use '?url=example.com' parameter"}), 400
+        
+    if not job_id:
+        # Generate a timestamp-based ID if not provided
+        job_id = f"job_{int(time.time() * 1000)}"
+        
+    # Check if job_id already exists
+    if job_id in jobs:
+        return jsonify({"error": f"Job ID '{job_id}' already exists. Please use a unique job ID"}), 400
+        
+    # Add http:// prefix if not present
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    # Create a new job
+    jobs[job_id] = {
+        'url': url,
+        'js_render': js_render,
+        'premium_proxy': premium_proxy,
+        'status': 'queued',
+        'submitted_at': time.time(),
+        'completed_at': None,
+        'result': None,
+        'credits_used': calculate_credits(js_render, premium_proxy)
+    }
+    
+    # Add to queue
+    request_queue.put(job_id)
+    
+    return jsonify({
+        "job_id": job_id,
+        "status": "queued",
+        "url": url,
+        "message": f"Job queued. Check status at /api/status?job_id={job_id}"
+    })
+
+@app.route('/api/status', methods=['GET'])
+def get_job_status():
+    """Get the status or result of a job by ID"""
+    job_id = request.args.get('job_id')
+    
+    if not job_id:
+        return jsonify({"error": "No job_id provided. Use '?job_id=YOUR_JOB_ID' parameter"}), 400
+        
+    if job_id not in jobs:
+        return jsonify({"error": f"Job '{job_id}' not found"}), 404
+        
+    job = jobs[job_id]
+    
+    # If job is completed, return the result
+    if job['status'] == 'completed':
+        return jsonify({
+            "job_id": job_id,
+            "status": "completed",
+            "url": job['url'],
+            "submitted_at": job['submitted_at'],
+            "completed_at": job['completed_at'],
+            "credits_used": job['credits_used'],
+            "result": job['result']
+        })
+    elif job['status'] == 'error':
+        return jsonify({
+            "job_id": job_id,
+            "status": "error",
+            "url": job['url'],
+            "submitted_at": job['submitted_at'],
+            "completed_at": job['completed_at'],
+            "error": job['result']
+        })
+    else:
+        # If job is still queued or processing
+        return jsonify({
+            "job_id": job_id,
+            "status": job['status'],
+            "url": job['url'],
+            "submitted_at": job['submitted_at'],
+            "message": "processing..."
+        })
+
+@app.route('/api/queue', methods=['GET'])
+def get_queue_status():
+    """Get status of all jobs in the queue"""
+    # Count jobs by status
+    status_counts = {
+        'queued': 0,
+        'processing': 0,
+        'completed': 0,
+        'error': 0
+    }
+    
+    for job in jobs.values():
+        if job['status'] in status_counts:
+            status_counts[job['status']] += 1
+    
+    return jsonify({
+        "queue_size": request_queue.qsize(),
+        "active_jobs": len(jobs),
+        "status_counts": status_counts,
+        "jobs": {
+            job_id: {
+                "status": job["status"],
+                "url": job["url"],
+                "submitted_at": job["submitted_at"],
+                "credits_used": job.get("credits_used", 0)
+            } for job_id, job in jobs.items()
+        }
+    })
+
+@app.route('/api/clear', methods=['GET'])
+def clear_completed():
+    """Clear completed and error jobs"""
+    count = 0
+    job_ids = list(jobs.keys())  # Create a copy of keys
+    
+    for job_id in job_ids:
+        if jobs[job_id]['status'] in ['completed', 'error']:
+            del jobs[job_id]
+            count += 1
+    
+    return jsonify({
+        "message": f"Cleared {count} completed/error jobs",
+        "remaining_jobs": len(jobs)
+    })
+
 @app.route('/api/scrape', methods=['GET'])
 def scrape_api():
-    """
-    API endpoint to scrape a website
-    
-    Query parameters:
-    - url: The URL to scrape (required)
-    - js_render: Whether to use JavaScript rendering (true/false, default: true)
-    - premium_proxy: Whether to use premium proxy (true/false, default: false)
-    
-    Returns:
-    - JSON response with the scraped data or error message
-    """
+    """Legacy endpoint for immediate scraping (no queuing)"""
     url = request.args.get('url')
     js_render = request.args.get('js_render', 'true')
     premium_proxy = request.args.get('premium_proxy', 'false')
@@ -210,14 +428,7 @@ def scrape_api():
         url = 'https://' + url
     
     # Calculate estimated credits
-    credit_cost = 1  # Base cost
-    if js_render.lower() == 'true':
-        credit_cost = 5  # Base cost with JS rendering
-    if premium_proxy.lower() == 'true':
-        if js_render.lower() == 'true':
-            credit_cost = 25  # Premium proxy with JS rendering
-        else:
-            credit_cost = 10  # Premium proxy without JS rendering
+    credit_cost = calculate_credits(js_render, premium_proxy)
     
     result = scrape_complete_homepage(url, js_render, premium_proxy)
     
@@ -233,7 +444,7 @@ def home():
     return '''
     <html>
         <head>
-            <title>Web Scraper API</title>
+            <title>Parallel Web Scraper API</title>
             <style>
                 body { font-family: Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 20px; }
                 code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
@@ -242,35 +453,117 @@ def home():
                 th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
                 th { background-color: #f4f4f4; }
                 tr:nth-child(even) { background-color: #f9f9f9; }
+                .endpoint { margin-bottom: 30px; border-bottom: 1px solid #eee; padding-bottom: 20px; }
             </style>
         </head>
         <body>
-            <h1>Web Scraper API</h1>
-            <p>Use the API endpoint <code>/api/scrape</code> to scrape a website.</p>
+            <h1>Parallel Web Scraper API</h1>
+            <p>This API allows you to queue and process multiple scraping jobs in parallel.</p>
             
-            <h2>Parameters:</h2>
-            <table>
-                <tr>
-                    <th>Parameter</th>
-                    <th>Description</th>
-                    <th>Default</th>
-                </tr>
-                <tr>
-                    <td>url</td>
-                    <td>The URL to scrape (required)</td>
-                    <td>-</td>
-                </tr>
-                <tr>
-                    <td>js_render</td>
-                    <td>Whether to use JavaScript rendering</td>
-                    <td>true</td>
-                </tr>
-                <tr>
-                    <td>premium_proxy</td>
-                    <td>Whether to use premium proxy</td>
-                    <td>false</td>
-                </tr>
-            </table>
+            <div class="endpoint">
+                <h2>1. Submit a Job</h2>
+                <p>Use the <code>/api/submit</code> endpoint to add a job to the queue.</p>
+                
+                <h3>Parameters:</h3>
+                <table>
+                    <tr>
+                        <th>Parameter</th>
+                        <th>Description</th>
+                        <th>Default</th>
+                    </tr>
+                    <tr>
+                        <td>url</td>
+                        <td>The URL to scrape (required)</td>
+                        <td>-</td>
+                    </tr>
+                    <tr>
+                        <td>job_id</td>
+                        <td>Custom ID for the job (optional)</td>
+                        <td>Auto-generated</td>
+                    </tr>
+                    <tr>
+                        <td>js_render</td>
+                        <td>Whether to use JavaScript rendering</td>
+                        <td>true</td>
+                    </tr>
+                    <tr>
+                        <td>premium_proxy</td>
+                        <td>Whether to use premium proxy</td>
+                        <td>false</td>
+                    </tr>
+                </table>
+                
+                <h3>Example:</h3>
+                <pre>GET /api/submit?url=example.com&job_id=my_custom_id&js_render=true&premium_proxy=false</pre>
+            </div>
+            
+            <div class="endpoint">
+                <h2>2. Check Job Status</h2>
+                <p>Use the <code>/api/status</code> endpoint to check the status of a job.</p>
+                
+                <h3>Parameters:</h3>
+                <table>
+                    <tr>
+                        <th>Parameter</th>
+                        <th>Description</th>
+                    </tr>
+                    <tr>
+                        <td>job_id</td>
+                        <td>ID of the job to check (required)</td>
+                    </tr>
+                </table>
+                
+                <h3>Example:</h3>
+                <pre>GET /api/status?job_id=my_custom_id</pre>
+            </div>
+            
+            <div class="endpoint">
+                <h2>3. View Queue Status</h2>
+                <p>Use the <code>/api/queue</code> endpoint to see the status of all jobs.</p>
+                
+                <h3>Example:</h3>
+                <pre>GET /api/queue</pre>
+            </div>
+            
+            <div class="endpoint">
+                <h2>4. Clear Completed Jobs</h2>
+                <p>Use the <code>/api/clear</code> endpoint to remove completed and error jobs.</p>
+                
+                <h3>Example:</h3>
+                <pre>GET /api/clear</pre>
+            </div>
+            
+            <div class="endpoint">
+                <h2>5. Direct Scraping (Legacy)</h2>
+                <p>Use the <code>/api/scrape</code> endpoint for immediate scraping (no queuing).</p>
+                
+                <h3>Parameters:</h3>
+                <table>
+                    <tr>
+                        <th>Parameter</th>
+                        <th>Description</th>
+                        <th>Default</th>
+                    </tr>
+                    <tr>
+                        <td>url</td>
+                        <td>The URL to scrape (required)</td>
+                        <td>-</td>
+                    </tr>
+                    <tr>
+                        <td>js_render</td>
+                        <td>Whether to use JavaScript rendering</td>
+                        <td>true</td>
+                    </tr>
+                    <tr>
+                        <td>premium_proxy</td>
+                        <td>Whether to use premium proxy</td>
+                        <td>false</td>
+                    </tr>
+                </table>
+                
+                <h3>Example:</h3>
+                <pre>GET /api/scrape?url=example.com&js_render=true&premium_proxy=false</pre>
+            </div>
             
             <h2>Credit Usage:</h2>
             <table>
@@ -296,15 +589,15 @@ def home():
                 </tr>
             </table>
             
-            <h2>Example:</h2>
-            <pre>GET /api/scrape?url=example.com&js_render=true&premium_proxy=false</pre>
-            <p>This will return a JSON object with the scraped website data.</p>
-            
             <h3>Testing Tool:</h3>
-            <form action="/api/scrape" method="get">
+            <form action="/api/submit" method="get">
                 <p>
                     <label for="url">URL to scrape:</label>
                     <input type="text" id="url" name="url" placeholder="example.com" required style="width: 300px;">
+                </p>
+                <p>
+                    <label for="job_id">Job ID (optional):</label>
+                    <input type="text" id="job_id" name="job_id" placeholder="my_custom_id" style="width: 300px;">
                 </p>
                 <p>
                     <label for="js_render">Use JavaScript rendering:</label>
@@ -321,14 +614,28 @@ def home():
                     </select>
                 </p>
                 <p>
-                    <button type="submit">Scrape Website</button>
+                    <button type="submit">Submit Scraping Job</button>
                 </p>
             </form>
         </body>
     </html>
     '''
 
+# Start the worker thread when the app starts
+worker_thread = None
+
+@app.before_first_request
+def start_worker():
+    global worker_thread
+    if worker_thread is None or not worker_thread.is_alive():
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
+
 if __name__ == '__main__':
+    # Start the worker thread
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+    
     # Run the Flask app
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False)
