@@ -15,8 +15,9 @@ API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 # ScrapingBee endpoint
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
 
-# In-memory job storage (in production, use Redis or a database)
-jobs = {}
+# In-memory job storage with two separate dictionaries
+processing_jobs = {}  # Jobs being processed
+completed_jobs = {}   # Completed jobs with results
 request_queue = queue.Queue()
 MAX_CONCURRENT_REQUESTS = 5
 worker_running = False
@@ -221,16 +222,15 @@ def worker():
             batch = []
             for _ in range(MAX_CONCURRENT_REQUESTS):
                 try:
-                    job_id = request_queue.get(block=False)
-                    if job_id in jobs:
+                    job_id = request_queue.get(block=True, timeout=1)  # Block with timeout
+                    if job_id in processing_jobs:
                         batch.append(job_id)
                     request_queue.task_done()
                 except queue.Empty:
-                    break
+                    break  # No more jobs in queue
             
             if not batch:
-                time.sleep(1)  # Sleep if no jobs are available
-                continue
+                continue  # Skip if no jobs found
             
             # Process the batch with ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=len(batch)) as executor:
@@ -246,8 +246,21 @@ def worker():
                         future.result()
                     except Exception as e:
                         job_id = futures[future]
-                        jobs[job_id]['status'] = 'error'
-                        jobs[job_id]['result'] = {"error": str(e)}
+                        # Move job to completed with error status
+                        if job_id in processing_jobs:
+                            job = processing_jobs[job_id]
+                            completed_jobs[job_id] = {
+                                'url': job['url'],
+                                'js_render': job['js_render'],
+                                'premium_proxy': job['premium_proxy'],
+                                'status': 'error',
+                                'submitted_at': job['submitted_at'],
+                                'completed_at': time.time(),
+                                'result': {"error": str(e)},
+                                'credits_used': job.get('credits_used', 0)
+                            }
+                            # Remove from processing
+                            del processing_jobs[job_id]
         
         except Exception as e:
             print(f"Worker error: {str(e)}")
@@ -256,8 +269,12 @@ def worker():
 def process_job(job_id):
     """Process a single job"""
     try:
-        job = jobs[job_id]
-        jobs[job_id]['status'] = 'processing'
+        if job_id not in processing_jobs:
+            print(f"Warning: Job {job_id} not found in processing queue")
+            return
+            
+        job = processing_jobs[job_id]
+        job['status'] = 'processing'
         
         # Call the scraping function
         result = scrape_complete_homepage(
@@ -266,19 +283,43 @@ def process_job(job_id):
             job['premium_proxy']
         )
         
-        # Update job with result
-        jobs[job_id]['status'] = 'completed'
-        jobs[job_id]['result'] = result
-        jobs[job_id]['completed_at'] = time.time()
-        
         # Calculate credits
         credit_cost = calculate_credits(job['js_render'], job['premium_proxy'])
-        jobs[job_id]['credits_used'] = credit_cost
         
+        # Create a completed job entry
+        completed_jobs[job_id] = {
+            'url': job['url'],
+            'js_render': job['js_render'],
+            'premium_proxy': job['premium_proxy'],
+            'status': 'completed',
+            'submitted_at': job['submitted_at'],
+            'completed_at': time.time(),
+            'result': result,
+            'credits_used': credit_cost
+        }
+        
+        # Remove from processing queue
+        if job_id in processing_jobs:
+            del processing_jobs[job_id]
+            
     except Exception as e:
-        jobs[job_id]['status'] = 'error'
-        jobs[job_id]['result'] = {"error": str(e)}
-        jobs[job_id]['completed_at'] = time.time()
+        # Handle errors by moving to completed with error status
+        if job_id in processing_jobs:
+            job = processing_jobs[job_id]
+            completed_jobs[job_id] = {
+                'url': job['url'],
+                'js_render': job['js_render'],
+                'premium_proxy': job['premium_proxy'],
+                'status': 'error',
+                'submitted_at': job['submitted_at'],
+                'completed_at': time.time(),
+                'result': {"error": str(e)},
+                'credits_used': job.get('credits_used', 0)
+            }
+            # Remove from processing
+            del processing_jobs[job_id]
+        else:
+            print(f"Error processing job {job_id} that's not in queue: {str(e)}")
 
 @app.route('/api/submit', methods=['GET'])
 def submit_job():
@@ -294,24 +335,23 @@ def submit_job():
     if not job_id:
         # Generate a timestamp-based ID if not provided
         job_id = f"job_{int(time.time() * 1000)}"
-        
-    # Check if job_id already exists
-    if job_id in jobs:
+    
+    # Check both queues to ensure job_id is unique
+    if job_id in processing_jobs or job_id in completed_jobs:
         return jsonify({"error": f"Job ID '{job_id}' already exists. Please use a unique job ID"}), 400
         
     # Add http:// prefix if not present
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
     
-    # Create a new job
-    jobs[job_id] = {
+    # Create a new job and add to processing queue
+    processing_jobs[job_id] = {
         'url': url,
         'js_render': js_render,
         'premium_proxy': premium_proxy,
         'status': 'queued',
         'submitted_at': time.time(),
         'completed_at': None,
-        'result': None,
         'credits_used': calculate_credits(js_render, premium_proxy)
     }
     
@@ -332,45 +372,55 @@ def get_job_status():
     
     if not job_id:
         return jsonify({"error": "No job_id provided. Use '?job_id=YOUR_JOB_ID' parameter"}), 400
-        
-    if job_id not in jobs:
-        return jsonify({"error": f"Job '{job_id}' not found"}), 404
-        
-    job = jobs[job_id]
     
-    # If job is completed, return the result
-    if job['status'] == 'completed':
-        return jsonify({
-            "job_id": job_id,
-            "status": "completed",
-            "url": job['url'],
-            "submitted_at": job['submitted_at'],
-            "completed_at": job['completed_at'],
-            "credits_used": job['credits_used'],
-            "result": job['result']
-        })
-    elif job['status'] == 'error':
-        return jsonify({
-            "job_id": job_id,
-            "status": "error",
-            "url": job['url'],
-            "submitted_at": job['submitted_at'],
-            "completed_at": job['completed_at'],
-            "error": job['result']
-        })
-    else:
-        # If job is still queued or processing
+    # First check if job is in processing queue
+    if job_id in processing_jobs:
+        job = processing_jobs[job_id]
         return jsonify({
             "job_id": job_id,
             "status": job['status'],
             "url": job['url'],
             "submitted_at": job['submitted_at'],
-            "message": "processing..."
+            "message": "Job is still processing..."
         })
+    
+    # Then check completed queue
+    elif job_id in completed_jobs:
+        job = completed_jobs[job_id]
+        
+        # Create response based on job status
+        if job['status'] == 'completed':
+            response = {
+                "job_id": job_id,
+                "status": "completed",
+                "url": job['url'],
+                "submitted_at": job['submitted_at'],
+                "completed_at": job['completed_at'],
+                "credits_used": job['credits_used'],
+                "result": job['result']
+            }
+        else:  # Error status
+            response = {
+                "job_id": job_id,
+                "status": "error",
+                "url": job['url'],
+                "submitted_at": job['submitted_at'],
+                "completed_at": job['completed_at'],
+                "error": job['result']
+            }
+        
+        # Remove from completed queue after returning results
+        del completed_jobs[job_id]
+        
+        return jsonify(response)
+    
+    # Job not found in either queue
+    else:
+        return jsonify({"error": f"Job '{job_id}' not found. It may have already been retrieved or never existed."}), 404
 
 @app.route('/api/queue', methods=['GET'])
 def get_queue_status():
-    """Get status of all jobs in the queue"""
+    """Get status of all jobs in both queues"""
     # Count jobs by status
     status_counts = {
         'queued': 0,
@@ -379,38 +429,50 @@ def get_queue_status():
         'error': 0
     }
     
-    for job in jobs.values():
+    # Count processing jobs
+    for job in processing_jobs.values():
+        if job['status'] in status_counts:
+            status_counts[job['status']] += 1
+    
+    # Count completed jobs
+    for job in completed_jobs.values():
         if job['status'] in status_counts:
             status_counts[job['status']] += 1
     
     return jsonify({
         "queue_size": request_queue.qsize(),
-        "active_jobs": len(jobs),
+        "processing_jobs": len(processing_jobs),
+        "completed_jobs": len(completed_jobs),
         "status_counts": status_counts,
-        "jobs": {
+        "processing_queue": {
             job_id: {
                 "status": job["status"],
                 "url": job["url"],
                 "submitted_at": job["submitted_at"],
                 "credits_used": job.get("credits_used", 0)
-            } for job_id, job in jobs.items()
+            } for job_id, job in processing_jobs.items()
+        },
+        "completed_queue": {
+            job_id: {
+                "status": job["status"],
+                "url": job["url"],
+                "submitted_at": job["submitted_at"],
+                "completed_at": job["completed_at"],
+                "credits_used": job.get("credits_used", 0)
+            } for job_id, job in completed_jobs.items()
         }
     })
 
 @app.route('/api/clear', methods=['GET'])
 def clear_completed():
-    """Clear completed and error jobs"""
-    count = 0
-    job_ids = list(jobs.keys())  # Create a copy of keys
-    
-    for job_id in job_ids:
-        if jobs[job_id]['status'] in ['completed', 'error']:
-            del jobs[job_id]
-            count += 1
+    """Clear completed jobs"""
+    count = len(completed_jobs)
+    completed_jobs.clear()
     
     return jsonify({
-        "message": f"Cleared {count} completed/error jobs",
-        "remaining_jobs": len(jobs)
+        "message": f"Cleared {count} completed jobs",
+        "remaining_processing_jobs": len(processing_jobs),
+        "remaining_completed_jobs": len(completed_jobs)
     })
 
 @app.route('/api/scrape', methods=['GET'])
@@ -500,6 +562,7 @@ def home():
             <div class="endpoint">
                 <h2>2. Check Job Status</h2>
                 <p>Use the <code>/api/status</code> endpoint to check the status of a job.</p>
+                <p><strong>Note:</strong> Once a completed job result is retrieved, it is removed from the system.</p>
                 
                 <h3>Parameters:</h3>
                 <table>
@@ -527,7 +590,7 @@ def home():
             
             <div class="endpoint">
                 <h2>4. Clear Completed Jobs</h2>
-                <p>Use the <code>/api/clear</code> endpoint to remove completed and error jobs.</p>
+                <p>Use the <code>/api/clear</code> endpoint to remove completed jobs from memory.</p>
                 
                 <h3>Example:</h3>
                 <pre>GET /api/clear</pre>
@@ -622,13 +685,15 @@ def home():
     '''
 
 # Start the worker thread when the app starts
-worker_thread = None
-worker_thread = threading.Thread(target=worker, daemon=True)
-worker_thread.start()
-
 if __name__ == '__main__':
     # Start the worker thread
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
 
     # Run the Flask app
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
+else:
+    # For when importing as a module or running with a WSGI server
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
