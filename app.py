@@ -7,7 +7,10 @@ import os
 import threading
 import queue
 import time
+import shutil
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 app = Flask(__name__)
 
@@ -15,9 +18,12 @@ API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 # ScrapingBee endpoint
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
 
-# In-memory job storage with two separate dictionaries
+# File system paths
+RESULTS_DIR = Path("results")
+RESULTS_DIR.mkdir(exist_ok=True)
+
+# In-memory processing queue
 processing_jobs = {}  # Jobs being processed
-completed_jobs = {}   # Completed jobs with results
 request_queue = queue.Queue()
 MAX_CONCURRENT_REQUESTS = 5
 worker_running = False
@@ -211,6 +217,35 @@ def calculate_credits(js_render, premium_proxy):
     else:
         return 1  # Base cost
 
+def save_job_result(job_id, job_data):
+    """Save job result to a file"""
+    try:
+        file_path = RESULTS_DIR / f"{job_id}.json"
+        with open(file_path, 'w') as f:
+            json.dump(job_data, f)
+        return True
+    except Exception as e:
+        print(f"Error saving job result: {str(e)}")
+        return False
+
+def get_job_result(job_id):
+    """Get job result from file"""
+    try:
+        file_path = RESULTS_DIR / f"{job_id}.json"
+        if not file_path.exists():
+            return None
+        
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        
+        # Delete the file after reading
+        file_path.unlink()
+        
+        return data
+    except Exception as e:
+        print(f"Error reading job result: {str(e)}")
+        return None
+
 def worker():
     """Background worker to process queued requests in batches of 5"""
     global worker_running
@@ -218,6 +253,9 @@ def worker():
     
     while worker_running:
         try:
+            # Clean old results (older than 24 hours)
+            clean_old_results()
+            
             # Get up to 5 jobs from the queue
             batch = []
             for _ in range(MAX_CONCURRENT_REQUESTS):
@@ -246,10 +284,10 @@ def worker():
                         future.result()
                     except Exception as e:
                         job_id = futures[future]
-                        # Move job to completed with error status
+                        # Handle error case
                         if job_id in processing_jobs:
                             job = processing_jobs[job_id]
-                            completed_jobs[job_id] = {
+                            error_result = {
                                 'url': job['url'],
                                 'js_render': job['js_render'],
                                 'premium_proxy': job['premium_proxy'],
@@ -259,6 +297,8 @@ def worker():
                                 'result': {"error": str(e)},
                                 'credits_used': job.get('credits_used', 0)
                             }
+                            # Save to file system
+                            save_job_result(job_id, error_result)
                             # Remove from processing
                             del processing_jobs[job_id]
         
@@ -287,7 +327,7 @@ def process_job(job_id):
         credit_cost = calculate_credits(job['js_render'], job['premium_proxy'])
         
         # Create a completed job entry
-        completed_jobs[job_id] = {
+        completed_job = {
             'url': job['url'],
             'js_render': job['js_render'],
             'premium_proxy': job['premium_proxy'],
@@ -298,15 +338,18 @@ def process_job(job_id):
             'credits_used': credit_cost
         }
         
+        # Save to file system
+        save_job_result(job_id, completed_job)
+        
         # Remove from processing queue
         if job_id in processing_jobs:
             del processing_jobs[job_id]
             
     except Exception as e:
-        # Handle errors by moving to completed with error status
+        # Handle errors by saving to file system with error status
         if job_id in processing_jobs:
             job = processing_jobs[job_id]
-            completed_jobs[job_id] = {
+            error_result = {
                 'url': job['url'],
                 'js_render': job['js_render'],
                 'premium_proxy': job['premium_proxy'],
@@ -316,10 +359,26 @@ def process_job(job_id):
                 'result': {"error": str(e)},
                 'credits_used': job.get('credits_used', 0)
             }
+            # Save to file system
+            save_job_result(job_id, error_result)
             # Remove from processing
             del processing_jobs[job_id]
         else:
             print(f"Error processing job {job_id} that's not in queue: {str(e)}")
+
+def clean_old_results():
+    """Clean results older than 24 hours"""
+    try:
+        current_time = time.time()
+        one_day_ago = current_time - (24 * 60 * 60)
+        
+        for file_path in RESULTS_DIR.glob("*.json"):
+            # Get file modification time
+            file_mtime = file_path.stat().st_mtime
+            if file_mtime < one_day_ago:
+                file_path.unlink()
+    except Exception as e:
+        print(f"Error cleaning old results: {str(e)}")
 
 @app.route('/api/submit', methods=['GET'])
 def submit_job():
@@ -336,8 +395,8 @@ def submit_job():
         # Generate a timestamp-based ID if not provided
         job_id = f"job_{int(time.time() * 1000)}"
     
-    # Check both queues to ensure job_id is unique
-    if job_id in processing_jobs or job_id in completed_jobs:
+    # Check if job_id already exists in processing or file system
+    if job_id in processing_jobs or (RESULTS_DIR / f"{job_id}.json").exists():
         return jsonify({"error": f"Job ID '{job_id}' already exists. Please use a unique job ID"}), 400
         
     # Add http:// prefix if not present
@@ -384,67 +443,64 @@ def get_job_status():
             "message": "Job is still processing..."
         })
     
-    # Then check completed queue
-    elif job_id in completed_jobs:
-        job = completed_jobs[job_id]
-        
+    # Then check in file system
+    result = get_job_result(job_id)
+    if result:
         # Create response based on job status
-        if job['status'] == 'completed':
+        if result['status'] == 'completed':
             response = {
                 "job_id": job_id,
                 "status": "completed",
-                "url": job['url'],
-                "submitted_at": job['submitted_at'],
-                "completed_at": job['completed_at'],
-                "credits_used": job['credits_used'],
-                "result": job['result']
+                "url": result['url'],
+                "submitted_at": result['submitted_at'],
+                "completed_at": result['completed_at'],
+                "credits_used": result['credits_used'],
+                "result": result['result']
             }
         else:  # Error status
             response = {
                 "job_id": job_id,
                 "status": "error",
-                "url": job['url'],
-                "submitted_at": job['submitted_at'],
-                "completed_at": job['completed_at'],
-                "error": job['result']
+                "url": result['url'],
+                "submitted_at": result['submitted_at'],
+                "completed_at": result['completed_at'],
+                "error": result['result']
             }
-        
-        # Remove from completed queue after returning results
-        del completed_jobs[job_id]
         
         return jsonify(response)
     
-    # Job not found in either queue
-    else:
-        return jsonify({"error": f"Job '{job_id}' not found. It may have already been retrieved or never existed."}), 404
+    # Job not found in either place
+    return jsonify({"error": f"Job '{job_id}' not found. It may have already been retrieved or never existed."}), 404
 
 @app.route('/api/queue', methods=['GET'])
 def get_queue_status():
-    """Get status of all jobs in both queues"""
-    # Count jobs by status
-    status_counts = {
+    """Get status of all jobs in the queue and results directory"""
+    # Count jobs in processing queue by status
+    processing_status_counts = {
         'queued': 0,
-        'processing': 0,
-        'completed': 0,
-        'error': 0
+        'processing': 0
     }
     
-    # Count processing jobs
     for job in processing_jobs.values():
-        if job['status'] in status_counts:
-            status_counts[job['status']] += 1
+        if job['status'] in processing_status_counts:
+            processing_status_counts[job['status']] += 1
     
-    # Count completed jobs
-    for job in completed_jobs.values():
-        if job['status'] in status_counts:
-            status_counts[job['status']] += 1
+    # Count completed jobs in file system
+    completed_count = len(list(RESULTS_DIR.glob("*.json")))
+    
+    # Combine counts
+    status_counts = {
+        'queued': processing_status_counts['queued'],
+        'processing': processing_status_counts['processing'],
+        'completed': completed_count
+    }
     
     return jsonify({
         "queue_size": request_queue.qsize(),
         "processing_jobs": len(processing_jobs),
-        "completed_jobs": len(completed_jobs),
+        "completed_jobs": completed_count,
         "status_counts": status_counts,
-        "processing_queue": {
+        "processing_jobs_list": {
             job_id: {
                 "status": job["status"],
                 "url": job["url"],
@@ -452,28 +508,27 @@ def get_queue_status():
                 "credits_used": job.get("credits_used", 0)
             } for job_id, job in processing_jobs.items()
         },
-        "completed_queue": {
-            job_id: {
-                "status": job["status"],
-                "url": job["url"],
-                "submitted_at": job["submitted_at"],
-                "completed_at": job["completed_at"],
-                "credits_used": job.get("credits_used", 0)
-            } for job_id, job in completed_jobs.items()
-        }
+        "completed_job_ids": [file.stem for file in RESULTS_DIR.glob("*.json")]
     })
 
 @app.route('/api/clear', methods=['GET'])
 def clear_completed():
-    """Clear completed jobs"""
-    count = len(completed_jobs)
-    completed_jobs.clear()
-    
-    return jsonify({
-        "message": f"Cleared {count} completed jobs",
-        "remaining_processing_jobs": len(processing_jobs),
-        "remaining_completed_jobs": len(completed_jobs)
-    })
+    """Clear all completed jobs"""
+    try:
+        completed_files = list(RESULTS_DIR.glob("*.json"))
+        count = len(completed_files)
+        
+        for file_path in completed_files:
+            file_path.unlink()
+        
+        return jsonify({
+            "message": f"Cleared {count} completed jobs",
+            "remaining_processing_jobs": len(processing_jobs)
+        })
+    except Exception as e:
+        return jsonify({
+            "error": f"Error clearing completed jobs: {str(e)}"
+        }), 500
 
 @app.route('/api/scrape', methods=['GET'])
 def scrape_api():
@@ -590,7 +645,7 @@ def home():
             
             <div class="endpoint">
                 <h2>4. Clear Completed Jobs</h2>
-                <p>Use the <code>/api/clear</code> endpoint to remove completed jobs from memory.</p>
+                <p>Use the <code>/api/clear</code> endpoint to remove completed jobs from the system.</p>
                 
                 <h3>Example:</h3>
                 <pre>GET /api/clear</pre>
@@ -684,8 +739,17 @@ def home():
     </html>
     '''
 
+# Function to ensure the results directory exists at startup
+def ensure_results_dir():
+    """Ensure the results directory exists"""
+    if not RESULTS_DIR.exists():
+        RESULTS_DIR.mkdir()
+
 # Start the worker thread when the app starts
 if __name__ == '__main__':
+    # Ensure results directory exists
+    ensure_results_dir()
+    
     # Start the worker thread
     worker_thread = threading.Thread(target=worker, daemon=True)
     worker_thread.start()
@@ -695,5 +759,6 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=port, debug=False)
 else:
     # For when importing as a module or running with a WSGI server
+    ensure_results_dir()
     worker_thread = threading.Thread(target=worker, daemon=True)
     worker_thread.start()
