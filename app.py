@@ -246,31 +246,6 @@ def get_job_result(job_id):
     except Exception as e:
         print(f"Error reading job result: {str(e)}")
         return None
-# Add a new endpoint to delete a specific job result by job_id
-@app.route('/api/delete', methods=['GET'])
-def delete_job_result():
-    """Delete a specific job result by job_id"""
-    job_id = request.args.get('job_id')
-    
-    if not job_id:
-        return jsonify({"error": "No job_id provided. Use '?job_id=YOUR_JOB_ID' parameter"}), 400
-    
-    try:
-        file_path = RESULTS_DIR / f"{job_id}.json"
-        
-        if file_path.exists():
-            file_path.unlink()  # Delete the file
-            return jsonify({
-                "message": f"Successfully deleted job result for job_id: {job_id}"
-            })
-        else:
-            return jsonify({
-                "error": f"No job result found for job_id: {job_id}"
-            }), 404
-    except Exception as e:
-        return jsonify({
-            "error": f"Error deleting job result: {str(e)}"
-        }), 500
 def worker():
     """Background worker to process queued requests in batches of 5"""
     global worker_running
