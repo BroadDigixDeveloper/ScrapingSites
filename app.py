@@ -305,6 +305,83 @@ def worker():
         except Exception as e:
             print(f"Worker error: {str(e)}")
             time.sleep(1)
+@app.route('/api/multiple_domains', methods=['GET'])
+def submit_multiple_domains_job():
+    """Submit multiple URLs as individual jobs but track them together"""
+    # Get all URL parameters (can be multiple with the same name)
+    urls = request.args.getlist('url')
+    js_render = request.args.get('js_render', 'true')
+    premium_proxy = request.args.get('premium_proxy', 'false')
+    parent_job_id = request.args.get('job_id')
+    
+    # Check if we have any URLs
+    if not urls:
+        return jsonify({"error": "No URLs provided. Use '?url=example1.com&url=example2.com' parameters"}), 400
+        
+    if not parent_job_id:
+        # Generate a timestamp-based ID if not provided
+        parent_job_id = f"multi_{int(time.time() * 1000)}"
+    
+    # Check if parent_job_id already exists
+    if (RESULTS_DIR / f"{parent_job_id}.json").exists():
+        return jsonify({"error": f"Job ID '{parent_job_id}' already exists. Please use a unique job ID"}), 400
+    
+    # Create a tracker file for this multi-domain job
+    tracker = {
+        'parent_job_id': parent_job_id,
+        'status': 'queued',
+        'urls': urls,
+        'url_count': len(urls),
+        'js_render': js_render,
+        'premium_proxy': premium_proxy,
+        'child_jobs': [],
+        'submitted_at': time.time(),
+        'completed_at': None,
+        'estimated_credits': calculate_credits(js_render, premium_proxy) * len(urls)
+    }
+    
+    # Create individual jobs for each URL
+    for i, url in enumerate(urls):
+        # Generate child job ID
+        child_job_id = f"{parent_job_id}_url{i}"
+        
+        # Add http:// prefix if not present
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        
+        # Create the job and add to processing queue
+        processing_jobs[child_job_id] = {
+            'url': url,
+            'js_render': js_render,
+            'premium_proxy': premium_proxy,
+            'status': 'queued',
+            'submitted_at': time.time(),
+            'completed_at': None,
+            'parent_job_id': parent_job_id,
+            'credits_used': calculate_credits(js_render, premium_proxy)
+        }
+        
+        # Add to queue - will be processed in parallel up to MAX_CONCURRENT_REQUESTS
+        request_queue.put(child_job_id)
+        
+        # Add to tracker
+        tracker['child_jobs'].append({
+            'job_id': child_job_id,
+            'url': url,
+            'status': 'queued'
+        })
+    
+    # Save tracker to file system
+    save_job_result(parent_job_id, tracker)
+    
+    return jsonify({
+        "parent_job_id": parent_job_id,
+        "status": "queued",
+        "urls": urls,
+        "url_count": len(urls),
+        "estimated_credits": tracker['estimated_credits'],
+        "message": f"Multiple domains job queued with {len(urls)} URLs. Check status at /api/status?job_id={parent_job_id}"
+    })
 
 def process_job(job_id):
     """Process a single job"""
@@ -315,6 +392,11 @@ def process_job(job_id):
             
         job = processing_jobs[job_id]
         job['status'] = 'processing'
+        
+        # Update parent job if this is a child job
+        parent_job_id = job.get('parent_job_id')
+        if parent_job_id:
+            update_child_job_status(parent_job_id, job_id, 'processing')
         
         # Call the scraping function
         result = scrape_complete_homepage(
@@ -338,8 +420,17 @@ def process_job(job_id):
             'credits_used': credit_cost
         }
         
+        # If this is a child job, add parent reference
+        if parent_job_id:
+            completed_job['parent_job_id'] = parent_job_id
+        
         # Save to file system
         save_job_result(job_id, completed_job)
+        
+        # Update parent job if this is a child job
+        if parent_job_id:
+            update_child_job_status(parent_job_id, job_id, 'completed')
+            check_parent_job_completion(parent_job_id)
         
         # Remove from processing queue
         if job_id in processing_jobs:
@@ -359,13 +450,99 @@ def process_job(job_id):
                 'result': {"error": str(e)},
                 'credits_used': job.get('credits_used', 0)
             }
+            
+            # If this is a child job, add parent reference
+            parent_job_id = job.get('parent_job_id')
+            if parent_job_id:
+                error_result['parent_job_id'] = parent_job_id
+            
             # Save to file system
             save_job_result(job_id, error_result)
+            
+            # Update parent job if this is a child job
+            if parent_job_id:
+                update_child_job_status(parent_job_id, job_id, 'error')
+                check_parent_job_completion(parent_job_id)
+            
             # Remove from processing
             del processing_jobs[job_id]
         else:
             print(f"Error processing job {job_id} that's not in queue: {str(e)}")
+def update_child_job_status(parent_job_id, child_job_id, status):
+    """Update the status of a child job in the parent tracker"""
+    try:
+        # Get parent job tracker
+        file_path = RESULTS_DIR / f"{parent_job_id}.json"
+        if not file_path.exists():
+            return
+        
+        with open(file_path, 'r') as f:
+            parent_job = json.load(f)
+        
+        # Update child job status
+        for child in parent_job.get('child_jobs', []):
+            if child.get('job_id') == child_job_id:
+                child['status'] = status
+                break
+        
+        # Save updated parent job
+        with open(file_path, 'w') as f:
+            json.dump(parent_job, f)
+    
+    except Exception as e:
+        print(f"Error updating child job status: {str(e)}")
 
+def check_parent_job_completion(parent_job_id):
+    """Check if all child jobs of a parent are completed and update parent status"""
+    try:
+        # Get parent job tracker
+        file_path = RESULTS_DIR / f"{parent_job_id}.json"
+        if not file_path.exists():
+            return
+        
+        with open(file_path, 'r') as f:
+            parent_job = json.load(f)
+        
+        # Check if all child jobs are completed or error
+        all_completed = True
+        for child in parent_job.get('child_jobs', []):
+            if child.get('status') not in ['completed', 'error']:
+                all_completed = False
+                break
+        
+        # If all completed, update parent job status
+        if all_completed:
+            parent_job['status'] = 'completed'
+            parent_job['completed_at'] = time.time()
+            
+            # Collect results from all child jobs
+            results = {}
+            total_credits = 0
+            
+            for child in parent_job.get('child_jobs', []):
+                child_job_id = child.get('job_id')
+                child_url = child.get('url')
+                
+                # Get child job result
+                child_result = get_job_result(child_job_id)
+                if child_result:
+                    results[child_url] = {
+                        'status': child_result.get('status'),
+                        'result': child_result.get('result'),
+                        'credits_used': child_result.get('credits_used', 0)
+                    }
+                    total_credits += child_result.get('credits_used', 0)
+            
+            # Add results to parent job
+            parent_job['results'] = results
+            parent_job['total_credits_used'] = total_credits
+            
+            # Save updated parent job
+            with open(file_path, 'w') as f:
+                json.dump(parent_job, f)
+    
+    except Exception as e:
+        print(f"Error checking parent job completion: {str(e)}")
 def clean_old_results():
     """Clean results older than 24 hours"""
     try:
@@ -438,7 +615,7 @@ def get_job_status():
         return jsonify({
             "job_id": job_id,
             "status": job['status'],
-            "url": job['url'],
+            "url": job.get('url', ''),
             "submitted_at": job['submitted_at'],
             "message": "Job is still processing..."
         })
@@ -446,28 +623,52 @@ def get_job_status():
     # Then check in file system
     result = get_job_result(job_id)
     if result:
-        # Create response based on job status
-        if result['status'] == 'completed':
+        # Check if this is a parent job (has child_jobs field)
+        if 'child_jobs' in result:
+            # It's a multi-domain job
             response = {
                 "job_id": job_id,
-                "status": "completed",
-                "url": result['url'],
+                "status": result['status'],
+                "url_count": result.get('url_count', 0),
                 "submitted_at": result['submitted_at'],
-                "completed_at": result['completed_at'],
-                "credits_used": result['credits_used'],
-                "result": result['result']
+                "completed_at": result.get('completed_at')
             }
-        else:  # Error status
-            response = {
-                "job_id": job_id,
-                "status": "error",
-                "url": result['url'],
-                "submitted_at": result['submitted_at'],
-                "completed_at": result['completed_at'],
-                "error": result['result']
-            }
-        
-        return jsonify(response)
+            
+            # If completed, include results
+            if result['status'] == 'completed':
+                response["total_credits_used"] = result.get('total_credits_used', 0)
+                response["results"] = result.get('results', {})
+            else:
+                # Include progress info
+                child_statuses = {}
+                for child in result.get('child_jobs', []):
+                    child_statuses[child.get('url')] = child.get('status')
+                response["progress"] = child_statuses
+            
+            return jsonify(response)
+        else:
+            # It's a regular job
+            if result['status'] == 'completed':
+                response = {
+                    "job_id": job_id,
+                    "status": "completed",
+                    "url": result['url'],
+                    "submitted_at": result['submitted_at'],
+                    "completed_at": result['completed_at'],
+                    "credits_used": result.get('credits_used', 0),
+                    "result": result['result']
+                }
+            else:  # Error status
+                response = {
+                    "job_id": job_id,
+                    "status": "error",
+                    "url": result['url'],
+                    "submitted_at": result['submitted_at'],
+                    "completed_at": result['completed_at'],
+                    "error": result['result']
+                }
+            
+            return jsonify(response)
     
     # Job not found in either place
     return jsonify({"error": f"Job '{job_id}' not found. It may have already been retrieved or never existed."}), 404
@@ -554,30 +755,30 @@ def delete_job_result():
         return jsonify({
             "error": f"Error deleting job result: {str(e)}"
         }), 500
-@app.route('/api/scrape', methods=['GET'])
-def scrape_api():
-    """Legacy endpoint for immediate scraping (no queuing)"""
-    url = request.args.get('url')
-    js_render = request.args.get('js_render', 'true')
-    premium_proxy = request.args.get('premium_proxy', 'false')
+# @app.route('/api/scrape', methods=['GET'])
+# def scrape_api():
+#     """Legacy endpoint for immediate scraping (no queuing)"""
+#     url = request.args.get('url')
+#     js_render = request.args.get('js_render', 'true')
+#     premium_proxy = request.args.get('premium_proxy', 'false')
     
-    if not url:
-        return jsonify({"error": "No URL provided. Use '?url=example.com' parameter"}), 400
+#     if not url:
+#         return jsonify({"error": "No URL provided. Use '?url=example.com' parameter"}), 400
     
-    # Add http:// prefix if not present
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
+#     # Add http:// prefix if not present
+#     if not url.startswith(('http://', 'https://')):
+#         url = 'https://' + url
     
-    # Calculate estimated credits
-    credit_cost = calculate_credits(js_render, premium_proxy)
+#     # Calculate estimated credits
+#     credit_cost = calculate_credits(js_render, premium_proxy)
     
-    result = scrape_complete_homepage(url, js_render, premium_proxy)
+#     result = scrape_complete_homepage(url, js_render, premium_proxy)
     
-    # Add credit information to the result
-    if isinstance(result, dict) and not result.get('error'):
-        result['credits_used'] = credit_cost
+#     # Add credit information to the result
+#     if isinstance(result, dict) and not result.get('error'):
+#         result['credits_used'] = credit_cost
     
-    return jsonify(result)
+#     return jsonify(result)
 
 @app.route('/', methods=['GET'])
 def home():
@@ -785,4 +986,4 @@ else:
     # For when importing as a module or running with a WSGI server
     ensure_results_dir()
     worker_thread = threading.Thread(target=worker, daemon=True)
-    worker_thread.start()
+    worker_thread.start() # type: ignore
