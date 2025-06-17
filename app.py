@@ -10,14 +10,12 @@ import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from dotenv import load_dotenv
 import concurrent.futures
 import threading
 
 
 app = Flask(__name__)
 
-load_dotenv()
 
 API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 # ScrapingBee endpoint
