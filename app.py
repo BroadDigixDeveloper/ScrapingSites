@@ -4,14 +4,13 @@ from bs4 import BeautifulSoup
 import json
 import re
 import os
-import threading
 import queue
 import time
-import shutil
-from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import concurrent.futures
+import threading
+
 
 app = Flask(__name__)
 
@@ -20,11 +19,12 @@ API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 # ScrapingBee endpoint
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
 
-
-
 # File system paths
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
+
+# for thread locking (prevent concurrent modifications in parent json)
+parent_job_lock = threading.Lock()
 
 # In-memory processing queue
 processing_jobs = {}  # Jobs being processed
@@ -32,9 +32,10 @@ request_queue = queue.Queue()
 MAX_CONCURRENT_REQUESTS = 5
 worker_running = False
 
-def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false', max_retries=3):
+def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false', max_retries=1):
     """
     Scrape homepage with retry logic and extended timeout, then format to single key
+    Immediately skip 404/400 errors without retrying
     """
     params = {
         'api_key': API_KEY,
@@ -52,30 +53,49 @@ def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false
 
     last_error = None
     
-    # Retry loop - try up to 3 times
+    # Retry loop - try up to max_retries times
     for attempt in range(max_retries):
         try:
-            print(f"🔄 Attempt {attempt + 1}/{max_retries} for URL: {url}")
-            
             # Extended timeout: 60s connect, 240s read (4 minutes total)
             response = requests.get(
                 SCRAPINGBEE_URL, 
                 params=params,
-                timeout=(60, 240)  # Increased timeout for retries
+                timeout=(60, 240)
             )
+
+            # 🚨 CHECK FOR 404/400 ERRORS - IMMEDIATE SKIP
+            if response.status_code == 404:
+                error_msg = f"404 Not Found: {url}"
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'error_type': '404_not_found',
+                    'skip_retry': True,
+                    'credits_used': calculate_credits(use_js_render, use_premium_proxy)
+                }
             
-            if response.status_code != 200:
+            elif response.status_code == 400:
+                error_msg = f"400 Bad Request: {url}"
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'error_type': '400_bad_request', 
+                    'skip_retry': True,
+                    'credits_used': calculate_credits(use_js_render, use_premium_proxy)
+                }
+
+            elif response.status_code != 200:
                 error_msg = f"ScrapingBee failed: {response.status_code}"
-                print(f"❌ Attempt {attempt + 1} failed: {error_msg}")
                 last_error = {"error": error_msg, "details": response.text, "attempt": attempt + 1}
                 
-                # If it's the last attempt, return the error
                 if attempt == max_retries - 1:
-                    return last_error
+                    return {
+                        'success': False,
+                        'error': error_msg,
+                        'credits_used': calculate_credits(use_js_render, use_premium_proxy)
+                    }
                 
-                # Wait before retry (exponential backoff)
-                wait_time = 2 ** attempt  # 1s, 2s, 4s
-                print(f"⏳ Waiting {wait_time}s before retry...")
+                wait_time = attempt + 1
                 time.sleep(wait_time)
                 continue
 
@@ -240,82 +260,96 @@ def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false
             # Format the structured data into single key format
             formatted_result = format_to_single_key(data)
             
-            # If we reach here, scraping was successful
-            print(f"✅ Successfully scraped and formatted {url} on attempt {attempt + 1}")
+            # Mark as successful and return
+            formatted_result['success'] = True
             return formatted_result
 
         except requests.exceptions.Timeout as e:
             error_msg = f"Timeout on attempt {attempt + 1}: {str(e)}"
-            print(f"⏰ {error_msg}")
             last_error = {"error": error_msg, "timeout": True, "attempt": attempt + 1}
             
-            # If it's the last attempt, return timeout error
             if attempt == max_retries - 1:
-                last_error['retry_info'] = {
-                    'attempts_made': max_retries,
-                    'successful': False,
-                    'final_error': 'timeout_after_retries'
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'retry_info': {
+                        'attempts_made': max_retries,
+                        'successful': False,
+                        'final_error': 'timeout_after_retries'
+                    },
+                    'credits_used': calculate_credits(use_js_render, use_premium_proxy)
                 }
-                return last_error
             
-            # Wait before retry
-            wait_time = 2 ** attempt
-            print(f"⏳ Waiting {wait_time}s before retry...")
+            wait_time = attempt + 1
             time.sleep(wait_time)
             
         except requests.exceptions.ConnectTimeout as e:
             error_msg = f"Connection timeout on attempt {attempt + 1}: {str(e)}"
-            print(f"🔌 {error_msg}")
             last_error = {"error": error_msg, "timeout": True, "attempt": attempt + 1}
             
             if attempt == max_retries - 1:
-                last_error['retry_info'] = {
-                    'attempts_made': max_retries,
-                    'successful': False,
-                    'final_error': 'connect_timeout_after_retries'
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'retry_info': {
+                        'attempts_made': max_retries,
+                        'successful': False,
+                        'final_error': 'connect_timeout_after_retries'
+                    },
+                    'credits_used': calculate_credits(use_js_render, use_premium_proxy)
                 }
-                return last_error
             
-            wait_time = 2 ** attempt
-            print(f"⏳ Waiting {wait_time}s before retry...")
+            wait_time = attempt + 1
             time.sleep(wait_time)
             
         except requests.exceptions.ReadTimeout as e:
             error_msg = f"Read timeout on attempt {attempt + 1}: {str(e)}"
-            print(f"📖 {error_msg}")
             last_error = {"error": error_msg, "timeout": True, "attempt": attempt + 1}
             
             if attempt == max_retries - 1:
-                last_error['retry_info'] = {
-                    'attempts_made': max_retries,
-                    'successful': False,
-                    'final_error': 'read_timeout_after_retries'
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'retry_info': {
+                        'attempts_made': max_retries,
+                        'successful': False,
+                        'final_error': 'read_timeout_after_retries'
+                    },
+                    'credits_used': calculate_credits(use_js_render, use_premium_proxy)
                 }
-                return last_error
             
-            wait_time = 2 ** attempt
-            print(f"⏳ Waiting {wait_time}s before retry...")
+            wait_time = attempt + 1
             time.sleep(wait_time)
             
         except Exception as e:
             error_msg = f"Unexpected error on attempt {attempt + 1}: {str(e)}"
-            print(f"💥 {error_msg}")
             last_error = {"error": error_msg, "attempt": attempt + 1}
             
             if attempt == max_retries - 1:
-                last_error['retry_info'] = {
-                    'attempts_made': max_retries,
-                    'successful': False,
-                    'final_error': 'unexpected_error_after_retries'
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'retry_info': {
+                        'attempts_made': max_retries,
+                        'successful': False,
+                        'final_error': 'unexpected_error_after_retries'
+                    },
+                    'credits_used': calculate_credits(use_js_render, use_premium_proxy)
                 }
-                return last_error
             
-            wait_time = 2 ** attempt
-            print(f"⏳ Waiting {wait_time}s before retry...")
+            wait_time = attempt + 1
             time.sleep(wait_time)
 
     # This should never be reached, but just in case
-    return last_error or {"error": "Unknown error occurred", "retry_info": {"attempts_made": max_retries, "successful": False}}
+    return {
+        'success': False,
+        'error': last_error.get('error', 'Unknown error occurred') if last_error else 'Unknown error occurred',
+        'retry_info': {
+            'attempts_made': max_retries,
+            'successful': False
+        },
+        'credits_used': calculate_credits(use_js_render, use_premium_proxy)
+    }
 
     
 def format_to_single_key(data):
@@ -750,90 +784,115 @@ def worker():
             print(f"Worker error: {str(e)}")
             time.sleep(1)
 
-
 @app.route('/api/multiple_domains', methods=['GET'])
 def submit_multiple_domains_job():
-    """Submit multiple URLs as individual jobs but track them together"""
-    # Get all URL parameters (can be multiple with the same name)
-    urls = request.args.getlist('url')
-    js_render = request.args.get('js_render', 'true')
-    premium_proxy = request.args.get('premium_proxy', 'false')
-    parent_job_id = request.args.get('job_id')
-    
-    # Check if we have any URLs
-    if not urls:
-        return jsonify({"error": "No URLs provided. Use '?url=example1.com&url=example2.com' parameters"}), 400
+    """Submit multiple domain scraping job"""
+    try:
+        urls = request.args.getlist('url')
+        js_render = request.args.get('js_render', 'false')
+        premium_proxy = request.args.get('premium_proxy', 'false')
+        parent_job_id = request.args.get('job_id')
         
-    if not parent_job_id:
-        # Generate a timestamp-based ID if not provided
-        parent_job_id = f"multi_{int(time.time() * 1000)}"
-    
-    # Check if parent_job_id already exists
-    if (RESULTS_DIR / f"{parent_job_id}.json").exists():
-        return jsonify({"error": f"Job ID '{parent_job_id}' already exists. Please use a unique job ID"}), 400
-    
-    # Create a tracker file for this multi-domain job
-    tracker = {
-        'parent_job_id': parent_job_id,
-        'status': 'queued',
-        'urls': urls,
-        'url_count': len(urls),
-        'js_render': js_render,
-        'premium_proxy': premium_proxy,
-        'child_jobs': [],
-        'submitted_at': time.time(),
-        'completed_at': None,
-        'estimated_credits': calculate_credits(js_render, premium_proxy) * len(urls)
-    }
-    
-    # Create individual jobs for each URL
-    for i, url in enumerate(urls):
-        # Generate child job ID
-        child_job_id = f"{parent_job_id}_url{i}"
+        if not urls:
+            return jsonify({"error": "No URLs provided"}), 400
         
-        # Add http:// prefix if not present
-        if not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
+        if not parent_job_id:
+            parent_job_id = f"multi_{int(time.time())}"
         
-        # Create the job and add to processing queue
-        processing_jobs[child_job_id] = {
-            'url': url,
+        # Create a tracker file for this multi-domain job
+        tracker = {
+            'parent_job_id': parent_job_id,
+            'status': 'queued',
+            'urls': urls,
+            'url_count': len(urls),
             'js_render': js_render,
             'premium_proxy': premium_proxy,
-            'status': 'queued',
+            'child_jobs': [],
             'submitted_at': time.time(),
+            'started_at': time.time(),
             'completed_at': None,
-            'parent_job_id': parent_job_id,
-            'credits_used': calculate_credits(js_render, premium_proxy)
+            'estimated_credits': calculate_credits(js_render, premium_proxy) * len(urls)
         }
         
-        # Add to queue - will be processed in parallel up to MAX_CONCURRENT_REQUESTS
-        request_queue.put(child_job_id)
+        # Ensure the directory exists and write the file properly
+        RESULTS_DIR.mkdir(exist_ok=True)
+        tracker_file_path = RESULTS_DIR / f"{parent_job_id}.json"
         
-        # Add to tracker
-        tracker['child_jobs'].append({
-            'job_id': child_job_id,
-            'url': url,
-            'status': 'queued'
+        # Write the tracker file with error handling
+        try:
+            with open(tracker_file_path, 'w') as f:
+                json.dump(tracker, f, indent=2)
+        except Exception as e:
+            return jsonify({"error": f"Failed to create job tracker: {str(e)}"}), 500
+        
+        # Verify the file was written correctly
+        if not tracker_file_path.exists() or tracker_file_path.stat().st_size == 0:
+            return jsonify({"error": "Failed to create job tracker file"}), 500
+        
+        # Create child jobs
+        child_jobs = []
+        for i, url in enumerate(urls):
+            child_job_id = f"{parent_job_id}_url{i}"
+            child_job = {
+                'job_id': child_job_id,
+                'url': url,
+                'js_render': js_render,
+                'premium_proxy': premium_proxy,
+                'status': 'queued',
+                'submitted_at': time.time(),
+                'parent_job_id': parent_job_id
+            }
+            child_jobs.append(child_job)
+        
+        # Update tracker with child jobs
+        tracker['child_jobs'] = child_jobs
+        
+        # Update the tracker file with child jobs
+        try:
+            with open(tracker_file_path, 'w') as f:
+                json.dump(tracker, f, indent=2)
+        except Exception as e:
+            return jsonify({"error": f"Failed to update job tracker: {str(e)}"}), 500
+        
+        # Process child jobs in batches
+        batch_size = 5
+        for i in range(0, len(child_jobs), batch_size):
+            batch = child_jobs[i:i+batch_size]
+            
+            # Add jobs to processing queue
+            for child_job in batch:
+                processing_jobs[child_job['job_id']] = child_job
+            
+            # Submit batch for processing with timeout
+            with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                # Submit all jobs in the batch
+                future_to_job = {
+                    executor.submit(process_job, child_job['job_id']): child_job['job_id']
+                    for child_job in batch
+                }
+                
+                # Wait for completion with timeout
+                for future in future_to_job:
+                    try:
+                        future.result(timeout=300)  # 5-minute timeout per job
+                    except Exception as e:
+                        pass
+        
+        return jsonify({
+            "message": f"Multi-domain job {parent_job_id} submitted successfully",
+            "parent_job_id": parent_job_id,
+            "total_urls": len(urls),
+            "estimated_credits": tracker['estimated_credits'],
+            "status": "queued"
         })
-    
-    # Save tracker to file system
-    save_job_result(parent_job_id, tracker)
-    
-    return jsonify({
-        "parent_job_id": parent_job_id,
-        "status": "queued",
-        "urls": urls,
-        "url_count": len(urls),
-        "estimated_credits": tracker['estimated_credits'],
-        "message": f"Multiple domains job queued with {len(urls)} URLs. Check status at /api/status?job_id={parent_job_id}"
-    })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-def process_job(job_id, max_job_retries=3):
-    """Process a single job with retry logic at the job level"""
+def process_job(job_id, max_job_retries=2):
+    """Process a single job with retry logic at the job level - 2 job attempts, 1 URL attempt each"""
     try:
         if job_id not in processing_jobs:
-            print(f"Warning: Job {job_id} not found in processing queue")
             return
             
         job = processing_jobs[job_id]
@@ -845,29 +904,25 @@ def process_job(job_id, max_job_retries=3):
             update_child_job_status(parent_job_id, job_id, 'processing')
         
         last_error = None
+        job_start_time = time.time()
         
-        # 🔄 JOB-LEVEL RETRY LOOP - try the entire scraping job 3 times
+        # Job-level retry loop - try the entire scraping job 2 times
         for job_attempt in range(max_job_retries):
             try:
-                print(f"🔄 Job Attempt {job_attempt + 1}/{max_job_retries} for job {job_id} - URL: {job['url']}")
+                attempt_start_time = time.time()
                 
-                # Call the scraping function (which has its own internal retries)
+                # Call the scraping function (1 URL attempt per job attempt)
                 result = scrape_complete_homepage(
                     job['url'], 
                     job['js_render'], 
-                    job['premium_proxy']
+                    job['premium_proxy'],
+                    max_retries=1
                 )
                 
                 # Check if scraping was successful
-                if isinstance(result, dict) and not result.get('error'):
-                    # ✅ Scraping succeeded
-                    print(f"✅ Job {job_id} succeeded on attempt {job_attempt + 1}")
-                    
+                if isinstance(result, dict) and result.get('success'):
                     # Get credits from result if available
-                    if 'credits_used' in result:
-                        credit_cost = result['credits_used']
-                    else:
-                        credit_cost = calculate_credits(job['js_render'], job['premium_proxy'])
+                    credit_cost = result.get('credits_used', calculate_credits(job['js_render'], job['premium_proxy']))
                     
                     # Create a completed job entry
                     completed_job = {
@@ -895,55 +950,95 @@ def process_job(job_id, max_job_retries=3):
                     # Update parent job if this is a child job
                     if parent_job_id:
                         update_child_job_status(parent_job_id, job_id, 'completed')
-                        check_parent_job_completion(parent_job_id)
                     
                     # Remove from processing queue
                     if job_id in processing_jobs:
                         del processing_jobs[job_id]
                     
-                    print(f"✅ Job {job_id} completed successfully on job attempt {job_attempt + 1}")
                     return  # Exit function on success
                 
+                # Check for immediate skip errors (404/400)
+                elif isinstance(result, dict) and result.get('skip_retry'):
+                    total_job_time = time.time() - job_start_time
+                    
+                    # Save result with error details
+                    job_result = {
+                        'job_id': job_id,
+                        'url': job['url'],
+                        'js_render': job['js_render'],
+                        'premium_proxy': job['premium_proxy'],
+                        'status': 'error',
+                        'submitted_at': job['submitted_at'],
+                        'completed_at': time.time(),
+                        'result': {
+                            'error': result.get('error'),
+                            'error_type': result.get('error_type'),
+                            'skipped_due_to_client_error': True
+                        },
+                        'credits_used': result.get('credits_used', 1),
+                        'total_time': total_job_time,
+                        'job_attempts': job_attempt + 1,
+                        'job_retry_info': {
+                            'job_attempts_made': job_attempt + 1,
+                            'job_successful': False,
+                            'skipped_immediately': True
+                        }
+                    }
+                    
+                    # If this is a child job, add parent reference
+                    if parent_job_id:
+                        job_result['parent_job_id'] = parent_job_id
+                    
+                    # Save to file system
+                    save_job_result(job_id, job_result)
+                    
+                    # Update parent job if this is a child job
+                    if parent_job_id:
+                        update_child_job_status(parent_job_id, job_id, 'error')
+                    
+                    # Remove from processing queue
+                    if job_id in processing_jobs:
+                        del processing_jobs[job_id]
+                    
+                    return  # Exit immediately, no more job attempts
+                
+                # Other errors (will retry)
                 else:
-                    # ❌ Scraping failed
                     error_msg = result.get('error', 'Unknown scraping error') if isinstance(result, dict) else str(result)
-                    print(f"❌ Job {job_id} attempt {job_attempt + 1} failed: {error_msg}")
                     last_error = {
                         "job_attempt": job_attempt + 1,
                         "error": error_msg,
-                        "result": result
+                        "result": result,
+                        "attempt_duration": time.time() - attempt_start_time
                     }
                     
                     # If it's the last attempt, break and handle error
                     if job_attempt == max_job_retries - 1:
-                        print(f"💥 Job {job_id} failed after {max_job_retries} attempts")
                         break
                     
-                    # Wait before retry (exponential backoff at job level)
-                    wait_time = 2 ** job_attempt  # 1s, 2s, 4s
-                    print(f"⏳ Waiting {wait_time}s before retrying job {job_id}...")
+                    # Wait before retry
+                    wait_time = job_attempt + 1
                     time.sleep(wait_time)
                     
             except Exception as job_error:
                 error_msg = f"Job attempt {job_attempt + 1} exception: {str(job_error)}"
-                print(f"💥 {error_msg}")
+                
                 last_error = {
                     "job_attempt": job_attempt + 1,
                     "error": error_msg,
-                    "exception": str(job_error)
+                    "exception": str(job_error),
+                    "attempt_duration": time.time() - attempt_start_time
                 }
                 
                 # If it's the last attempt, break and handle error
                 if job_attempt == max_job_retries - 1:
-                    print(f"💥 Job {job_id} failed after {max_job_retries} attempts with exceptions")
                     break
                 
                 # Wait before retry
-                wait_time = 2 ** job_attempt
-                print(f"⏳ Waiting {wait_time}s before retrying job {job_id}...")
+                wait_time = job_attempt + 1
                 time.sleep(wait_time)
         
-        # 🚨 All job attempts failed - create error result
+        # All job attempts failed - create error result
         error_result = {
             'url': job['url'],
             'js_render': job['js_render'],
@@ -973,54 +1068,80 @@ def process_job(job_id, max_job_retries=3):
         # Update parent job if this is a child job
         if parent_job_id:
             update_child_job_status(parent_job_id, job_id, 'error')
-            check_parent_job_completion(parent_job_id)
         
         # Remove from processing
         if job_id in processing_jobs:
             del processing_jobs[job_id]
             
-        print(f"❌ Job {job_id} marked as error after {max_job_retries} attempts")
-            
     except Exception as e:
-        # Handle unexpected errors in job processing
-        print(f"💥 Unexpected error in process_job for {job_id}: {str(e)}")
         if job_id in processing_jobs:
             del processing_jobs[job_id]
 
-def update_child_job_status(parent_job_id, child_job_id, status):
-    """Update the status of a child job in the parent tracker"""
-    try:
-        # Get parent job tracker
-        file_path = RESULTS_DIR / f"{parent_job_id}.json"
-        if not file_path.exists():
-            return
-        
-        with open(file_path, 'r') as f:
-            parent_job = json.load(f)
-        
-        # Update child job status
-        for child in parent_job.get('child_jobs', []):
-            if child.get('job_id') == child_job_id:
-                child['status'] = status
-                break
-        
-        # Save updated parent job
-        with open(file_path, 'w') as f:
-            json.dump(parent_job, f)
-    
-    except Exception as e:
-        print(f"Error updating child job status: {str(e)}")
 
-def check_parent_job_completion(parent_job_id):
-    """Check if all child jobs of a parent are completed and update parent status"""
+def update_child_job_status(parent_job_id, child_job_id, status):
+    """Update the status of a child job in the parent tracker with simple threading lock"""
     try:
-        # Get parent job tracker
         file_path = RESULTS_DIR / f"{parent_job_id}.json"
         if not file_path.exists():
             return
         
+        # Use simple threading lock to prevent concurrent writes
+        with parent_job_lock:
+            # Read current content
+            with open(file_path, 'r') as f:
+                content = f.read()
+            
+            if not content.strip():
+                return
+            
+            try:
+                parent_job = json.loads(content)
+            except json.JSONDecodeError as e:
+                return
+            
+            # Update child job status
+            updated = False
+            for child in parent_job.get('child_jobs', []):
+                if child.get('job_id') == child_job_id:
+                    child['status'] = status
+                    updated = True
+                    break
+            
+            if not updated:
+                return
+            
+            # Write back to file
+            with open(file_path, 'w') as f:
+                json.dump(parent_job, f, indent=2)
+            
+            # Check completion after updating (while still holding the lock)
+            check_parent_job_completion_locked(parent_job_id)
+        
+    except Exception as e:
+        pass
+
+def check_parent_job_completion_locked(parent_job_id):
+    """Check completion while already holding the lock - INTERNAL USE ONLY"""
+    try:
+        file_path = RESULTS_DIR / f"{parent_job_id}.json"
+        if not file_path.exists():
+            return
+        
+        # Read current content (lock already held by caller)
         with open(file_path, 'r') as f:
-            parent_job = json.load(f)
+            content = f.read()
+        
+        if not content.strip():
+            return
+        
+        try:
+            parent_job = json.loads(content)
+        except json.JSONDecodeError as e:
+            return
+        
+        # Check if already completed
+        if parent_job.get('status') == 'completed':
+            return
         
         # Check if all child jobs are completed, error, or timeout
         all_completed = True
@@ -1031,8 +1152,17 @@ def check_parent_job_completion(parent_job_id):
         
         # If all completed, update parent job status
         if all_completed:
+            completion_time = time.time()
             parent_job['status'] = 'completed'
-            parent_job['completed_at'] = time.time()
+            parent_job['completed_at'] = completion_time
+            
+            # Add timing to parent job data
+            if 'started_at' in parent_job:
+                total_duration = completion_time - parent_job['started_at']
+                parent_job['timing'] = {
+                    'total_duration_seconds': round(total_duration, 2),
+                    'average_per_url_seconds': round(total_duration / parent_job['url_count'], 2)
+                }
             
             # Collect results from all child jobs
             results = {}
@@ -1074,12 +1204,18 @@ def check_parent_job_completion(parent_job_id):
                 'errors': error_count
             }
             
-            # Save updated parent job
+            # Write back to file
             with open(file_path, 'w') as f:
-                json.dump(parent_job, f)
-    
+                json.dump(parent_job, f, indent=2)
+            
     except Exception as e:
-        print(f"Error checking parent job completion: {str(e)}")
+        pass
+
+# Keep the old function for external calls (but make it use the lock)
+def check_parent_job_completion(parent_job_id):
+    """Public function to check parent job completion with locking"""
+    with parent_job_lock:
+        check_parent_job_completion_locked(parent_job_id)
 
 def clean_old_results():
     """Clean results older than 24 hours"""
@@ -1408,32 +1544,6 @@ def delete_job_result():
         return jsonify({
             "error": f"Error deleting job result: {str(e)}"
         }), 500
-    
-
-# @app.route('/api/scrape', methods=['GET'])
-# def scrape_api():
-#     """Legacy endpoint for immediate scraping (no queuing)"""
-#     url = request.args.get('url')
-#     js_render = request.args.get('js_render', 'true')
-#     premium_proxy = request.args.get('premium_proxy', 'false')
-    
-#     if not url:
-#         return jsonify({"error": "No URL provided. Use '?url=example.com' parameter"}), 400
-    
-#     # Add http:// prefix if not present
-#     if not url.startswith(('http://', 'https://')):
-#         url = 'https://' + url
-    
-#     # Calculate estimated credits
-#     credit_cost = calculate_credits(js_render, premium_proxy)
-    
-#     result = scrape_complete_homepage(url, js_render, premium_proxy)
-    
-#     # Add credit information to the result
-#     if isinstance(result, dict) and not result.get('error'):
-#         result['credits_used'] = credit_cost
-    
-#     return jsonify(result)
 
 @app.route('/api/debug', methods=['GET'])
 def debug_routes():
