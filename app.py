@@ -4,16 +4,20 @@ from bs4 import BeautifulSoup
 import json
 import re
 import os
+import threading
 import queue
 import time
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from dotenv import load_dotenv
 import concurrent.futures
 import threading
 
 
 app = Flask(__name__)
 
+load_dotenv()
 
 API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 # ScrapingBee endpoint
@@ -29,7 +33,7 @@ parent_job_lock = threading.Lock()
 # In-memory processing queue
 processing_jobs = {}  # Jobs being processed
 request_queue = queue.Queue()
-MAX_CONCURRENT_REQUESTS = 5
+MAX_CONCURRENT_REQUESTS = 50
 worker_running = False
 
 def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false', max_retries=1):
@@ -728,7 +732,7 @@ def get_job_result(job_id):
         return None
     
 def worker():
-    """Background worker to process queued requests in batches of 5"""
+    """Background worker to process queued requests in batches of 50"""
     global worker_running
     worker_running = True
     
@@ -737,7 +741,7 @@ def worker():
             # Clean old results (older than 24 hours)
             clean_old_results()
             
-            # Get up to 5 jobs from the queue
+            # Get up to 50 jobs from the queue (changed from 5)
             batch = []
             for _ in range(MAX_CONCURRENT_REQUESTS):
                 try:
@@ -784,7 +788,6 @@ def worker():
             print(f"Worker error: {str(e)}")
             time.sleep(1)
 
-@app.route('/api/multiple_domains', methods=['GET'])
 def submit_multiple_domains_job():
     """Submit multiple domain scraping job"""
     try:
@@ -854,8 +857,8 @@ def submit_multiple_domains_job():
         except Exception as e:
             return jsonify({"error": f"Failed to update job tracker: {str(e)}"}), 500
         
-        # Process child jobs in batches
-        batch_size = 5
+        # Process child jobs in batches of 50 (changed from 5)
+        batch_size = 50
         for i in range(0, len(child_jobs), batch_size):
             batch = child_jobs[i:i+batch_size]
             
@@ -883,7 +886,8 @@ def submit_multiple_domains_job():
             "parent_job_id": parent_job_id,
             "total_urls": len(urls),
             "estimated_credits": tracker['estimated_credits'],
-            "status": "queued"
+            "status": "queued",
+            "max_parallel_jobs": 50  # Added for clarity
         })
         
     except Exception as e:
