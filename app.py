@@ -4,10 +4,8 @@ from bs4 import BeautifulSoup
 import json
 import re
 import os
-import threading
 import queue
 import time
-from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import concurrent.futures
@@ -730,7 +728,7 @@ def get_job_result(job_id):
         return None
     
 def worker():
-    """Background worker to process queued requests in batches of 50"""
+    """Background worker to process queued requests in batches of 5"""
     global worker_running
     worker_running = True
     
@@ -739,7 +737,7 @@ def worker():
             # Clean old results (older than 24 hours)
             clean_old_results()
             
-            # Get up to 15 jobs from the queue (changed from 5)
+            # Get up to 5 jobs from the queue
             batch = []
             for _ in range(MAX_CONCURRENT_REQUESTS):
                 try:
@@ -788,7 +786,7 @@ def worker():
 
 @app.route('/api/multiple_domains', methods=['GET'])
 def submit_multiple_domains_job():
-    """Submit multiple domain scraping job with true queue processing"""
+    """Submit multiple domain scraping job"""
     try:
         urls = request.args.getlist('url')
         js_render = request.args.get('js_render', 'false')
@@ -856,34 +854,36 @@ def submit_multiple_domains_job():
         except Exception as e:
             return jsonify({"error": f"Failed to update job tracker: {str(e)}"}), 500
         
-        # ✅ TRUE QUEUE PROCESSING - Add ALL jobs to processing queue
-        for child_job in child_jobs:
-            processing_jobs[child_job['job_id']] = child_job
-        
-        # ✅ Submit ALL jobs at once - no batching, true queue behavior
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            # Submit all jobs simultaneously to the thread pool
-            future_to_job = {
-                executor.submit(process_job, child_job['job_id']): child_job['job_id']
-                for child_job in child_jobs  # ALL jobs submitted at once
-            }
+        # Process child jobs in batches
+        batch_size = 5
+        for i in range(0, len(child_jobs), batch_size):
+            batch = child_jobs[i:i+batch_size]
             
-            # Wait for ALL jobs to complete (threads will pick up next job automatically)
-            for future in concurrent.futures.as_completed(future_to_job):
-                try:
-                    future.result(timeout=300)  # 5-minute timeout per job
-                except Exception as e:
-                    job_id = future_to_job[future]
-                    print(f"❌ Job {job_id} failed: {str(e)}")
+            # Add jobs to processing queue
+            for child_job in batch:
+                processing_jobs[child_job['job_id']] = child_job
+            
+            # Submit batch for processing with timeout
+            with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                # Submit all jobs in the batch
+                future_to_job = {
+                    executor.submit(process_job, child_job['job_id']): child_job['job_id']
+                    for child_job in batch
+                }
+                
+                # Wait for completion with timeout
+                for future in future_to_job:
+                    try:
+                        future.result(timeout=300)  # 5-minute timeout per job
+                    except Exception as e:
+                        pass
         
         return jsonify({
             "message": f"Multi-domain job {parent_job_id} submitted successfully",
             "parent_job_id": parent_job_id,
             "total_urls": len(urls),
             "estimated_credits": tracker['estimated_credits'],
-            "status": "queued",
-            "processing_mode": "true_queue",  # Indicate the processing mode
-            "max_parallel_jobs": 5
+            "status": "queued"
         })
         
     except Exception as e:
