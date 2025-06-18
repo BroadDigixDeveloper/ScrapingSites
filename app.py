@@ -29,7 +29,7 @@ parent_job_lock = threading.Lock()
 # In-memory processing queue
 processing_jobs = {}  # Jobs being processed
 request_queue = queue.Queue()
-MAX_CONCURRENT_REQUESTS = 5
+MAX_CONCURRENT_REQUESTS = 10
 worker_running = False
 
 def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false', max_retries=1):
