@@ -786,7 +786,7 @@ def worker():
 
 @app.route('/api/multiple_domains', methods=['GET'])
 def submit_multiple_domains_job():
-    """Submit multiple domain scraping job"""
+    """Submit multiple domain scraping job - FIXED VERSION"""
     try:
         urls = request.args.getlist('url')
         js_render = request.args.get('js_render', 'false')
@@ -854,41 +854,25 @@ def submit_multiple_domains_job():
         except Exception as e:
             return jsonify({"error": f"Failed to update job tracker: {str(e)}"}), 500
         
-        # Process child jobs in batches
-        batch_size = 5
-        for i in range(0, len(child_jobs), batch_size):
-            batch = child_jobs[i:i+batch_size]
-            
-            # Add jobs to processing queue
-            for child_job in batch:
-                processing_jobs[child_job['job_id']] = child_job
-            
-            # Submit batch for processing with timeout
-            with ThreadPoolExecutor(max_workers=batch_size) as executor:
-                # Submit all jobs in the batch
-                future_to_job = {
-                    executor.submit(process_job, child_job['job_id']): child_job['job_id']
-                    for child_job in batch
-                }
-                
-                # Wait for completion with timeout
-                for future in future_to_job:
-                    try:
-                        future.result(timeout=300)  # 5-minute timeout per job
-                    except Exception as e:
-                        pass
+        # ✅ FIXED: Just add jobs to the queue, don't wait for them to complete
+        for child_job in child_jobs:
+            # Add to processing jobs
+            processing_jobs[child_job['job_id']] = child_job
+            # Add to the request queue for the worker to process
+            request_queue.put(child_job['job_id'])
         
+        # ✅ Return immediately after queuing all jobs
         return jsonify({
             "message": f"Multi-domain job {parent_job_id} submitted successfully",
             "parent_job_id": parent_job_id,
             "total_urls": len(urls),
             "estimated_credits": tracker['estimated_credits'],
-            "status": "queued"
+            "status": "queued",
+            "note": f"All {len(urls)} URLs have been queued for processing. Use /api/status?job_id={parent_job_id} to check progress."
         })
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 def process_job(job_id, max_job_retries=2):
     """Process a single job with retry logic at the job level - 2 job attempts, 1 URL attempt each"""
     try:
