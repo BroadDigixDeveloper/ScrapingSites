@@ -31,7 +31,7 @@ parent_job_lock = threading.Lock()
 # In-memory processing queue
 processing_jobs = {}  # Jobs being processed
 request_queue = queue.Queue()
-MAX_CONCURRENT_REQUESTS = 10
+MAX_CONCURRENT_REQUESTS = 5
 worker_running = False
 
 def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false', max_retries=1):
@@ -861,7 +861,7 @@ def submit_multiple_domains_job():
             processing_jobs[child_job['job_id']] = child_job
         
         # ✅ Submit ALL jobs at once - no batching, true queue behavior
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=5) as executor:
             # Submit all jobs simultaneously to the thread pool
             future_to_job = {
                 executor.submit(process_job, child_job['job_id']): child_job['job_id']
@@ -883,7 +883,7 @@ def submit_multiple_domains_job():
             "estimated_credits": tracker['estimated_credits'],
             "status": "queued",
             "processing_mode": "true_queue",  # Indicate the processing mode
-            "max_parallel_jobs": 10
+            "max_parallel_jobs": 5
         })
         
     except Exception as e:
