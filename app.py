@@ -926,7 +926,126 @@ def normalize_url(url):
         url = f"https://{url}"  # ✅ NO trailing slash
     
     return url
+
+#JOB UNIQUENESS
+def check_job_id_exists(job_id):
+    """
+    Check if a job_id already exists in either parent_jobs or child_jobs collection
+    Returns: (exists: bool, location: str, details: dict)
+    """
+    try:
+        # Check in parent_jobs collection
+        parent_job = simple_db_retry(lambda: parent_jobs_collection.find_one(
+            {"job_id": job_id}, 
+            {"job_id": 1, "status": 1, "submitted_at": 1, "total_urls": 1}
+        ))
+        
+        if parent_job:
+            return True, "parent_jobs", {
+                "job_id": job_id,
+                "status": parent_job.get("status"),
+                "submitted_at": parent_job.get("submitted_at"),
+                "type": "parent_job",
+                "total_urls": parent_job.get("total_urls", 0)
+            }
+        
+        # Check in child_jobs collection
+        child_job = simple_db_retry(lambda: child_jobs_collection.find_one(
+            {"job_id": job_id}, 
+            {"job_id": 1, "status": 1, "submitted_at": 1, "url": 1, "parent_job_id": 1}
+        ))
+        
+        if child_job:
+            return True, "child_jobs", {
+                "job_id": job_id,
+                "status": child_job.get("status"),
+                "submitted_at": child_job.get("submitted_at"),
+                "type": "child_job",
+                "url": child_job.get("url"),
+                "parent_job_id": child_job.get("parent_job_id")
+            }
+        
+        # Job ID doesn't exist
+        return False, None, None
+        
+    except Exception as e:
+        print(f"❌ Error checking job_id existence: {str(e)}")
+        # In case of error, assume it exists to be safe
+        return True, "error", {"error": str(e)}
+
+def validate_job_id_unique(job_id, job_type="single"):
+    """
+    Validate that a job_id is unique and return appropriate error response if not
+    Returns: (is_valid: bool, error_response: dict or None)
+    """
+    if not job_id:
+        return True, None  # No job_id provided, will be auto-generated
     
+    exists, location, details = check_job_id_exists(job_id)
+    
+    if not exists:
+        return True, None  # Job ID is unique, good to go
+    
+    # Job ID already exists, create error response
+    if location == "error":
+        error_response = {
+            "error": f"Unable to validate job_id '{job_id}' due to database error",
+            "details": details,
+            "suggestion": "Try again with a different job_id or let the system auto-generate one"
+        }
+        return False, error_response
+    
+    # Format error message based on existing job type
+    existing_type = details.get("type", "unknown")
+    existing_status = details.get("status", "unknown")
+    
+    if existing_type == "parent_job":
+        error_message = f"Job ID '{job_id}' already exists as a multi-domain job with status '{existing_status}'"
+        if details.get("total_urls"):
+            error_message += f" (processing {details['total_urls']} URLs)"
+    else:
+        error_message = f"Job ID '{job_id}' already exists as a single job with status '{existing_status}'"
+        if details.get("url"):
+            error_message += f" for URL: {details['url']}"
+    
+    error_response = {
+        "error": error_message,
+        "existing_job": details,
+        "suggestion": f"Use a different job_id or check the status of existing job at /api/status?job_id={job_id}"
+    }
+    
+    return False, error_response  
+#JOB UNIQUENESS END  
+# ✅ NEW ENDPOINT: Check if job_id is available
+@app.route('/api/check_job_id', methods=['GET'])
+def check_job_id_availability():
+    """Check if a job_id is available for use"""
+    try:
+        job_id = request.args.get('job_id')
+        
+        if not job_id:
+            return jsonify({"error": "job_id parameter is required"}), 400
+        
+        exists, location, details = check_job_id_exists(job_id)
+        
+        if not exists:
+            return jsonify({
+                "job_id": job_id,
+                "available": True,
+                "message": f"Job ID '{job_id}' is available for use"
+            })
+        else:
+            return jsonify({
+                "job_id": job_id,
+                "available": False,
+                "message": f"Job ID '{job_id}' already exists",
+                "existing_job": details,
+                "location": location
+            })
+            
+    except Exception as e:
+        print(f"❌ ERROR in check_job_id_availability: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 def check_parent_completions():
     """Check all active parent jobs for completion"""
     try:
@@ -1025,6 +1144,15 @@ def submit_multiple_domains_job():
         if not raw_urls:
             return jsonify({"error": "No URLs provided"}), 400
         
+        # ✅ VALIDATE JOB ID UNIQUENESS
+        if parent_job_id:
+            is_valid, error_response = validate_job_id_unique(parent_job_id, "multi-domain")
+            if not is_valid:
+                print(f"❌ DUPLICATE JOB ID REJECTED: {parent_job_id}")
+                return jsonify(error_response), 409  # 409 Conflict
+        else:
+            parent_job_id = f"multi_{int(time.time())}"
+        
         # ✅ NORMALIZE URLs - add protocols if missing
         urls = []
         invalid_urls = []
@@ -1046,9 +1174,6 @@ def submit_multiple_domains_job():
         
         if invalid_urls:
             print(f"⚠️ Skipped {len(invalid_urls)} invalid URLs: {invalid_urls}")
-        
-        if not parent_job_id:
-            parent_job_id = f"multi_{int(time.time())}"
         
         print(f"🎯 MULTI-DOMAIN JOB STARTED: {parent_job_id} with {len(urls)} valid URLs")
         
@@ -1077,6 +1202,14 @@ def submit_multiple_domains_job():
         child_job_ids = []
         for i, url in enumerate(urls):
             child_job_id = f"{parent_job_id}_url{i}"
+            
+            # ✅ VALIDATE CHILD JOB ID UNIQUENESS (should not happen but be safe)
+            child_exists, _, _ = check_job_id_exists(child_job_id)
+            if child_exists:
+                # Generate alternative child job ID
+                child_job_id = f"{parent_job_id}_url{i}_{int(time.time())}"
+                print(f"⚠️ Child job ID conflict resolved: using {child_job_id}")
+            
             child_job = {
                 "job_id": child_job_id,
                 "parent_job_id": parent_job_id,
@@ -1424,12 +1557,18 @@ def submit_job():
         if not raw_url:
             return jsonify({"error": "URL parameter is required"}), 400
         
+        # ✅ VALIDATE JOB ID UNIQUENESS
+        if job_id:
+            is_valid, error_response = validate_job_id_unique(job_id, "single")
+            if not is_valid:
+                print(f"❌ DUPLICATE JOB ID REJECTED: {job_id}")
+                return jsonify(error_response), 409  # 409 Conflict
+        else:
+            job_id = f"single_{int(time.time())}"
+        
         # ✅ NORMALIZE URL
         url = normalize_url(raw_url)
         print(f"📝 Normalized: {raw_url} → {url}")
-        
-        if not job_id:
-            job_id = f"single_{int(time.time())}"
         
         print(f"🎯 SINGLE JOB SUBMITTED: {job_id} for URL: {url}")
         
