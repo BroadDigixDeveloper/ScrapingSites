@@ -15,7 +15,7 @@ from datetime import datetime, timedelta,timezone
 
 
 app = Flask(__name__)
-worker_running = False
+worker_running = True
 
 # ✅ ADD: Batch update configuration
 BATCH_SIZE = 10  # Update MongoDB when 10 jobs are completed
