@@ -4,328 +4,33 @@ from bs4 import BeautifulSoup
 import json
 import re
 import os
+import queue
 import time
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
-from datetime import datetime, timedelta,timezone
-
+import concurrent.futures
+import threading
 
 
 app = Flask(__name__)
-worker_running = True
-
-# ✅ ADD: Batch update configuration
-BATCH_SIZE = 10  # Update MongoDB when 10 jobs are completed
-TEMP_RESULTS_DIR = Path("temp_completed_jobs")  # Local storage for completed jobs
-TEMP_RESULTS_DIR.mkdir(exist_ok=True)  # Create directory if it doesn't exist
-
-def connect_to_mongodb(max_retries=3, retry_delay=10):  # Increased delay
-    """Network-resilient MongoDB connection for Atlas"""
-    
-    mongodb_uri = os.getenv("MONGODB_URI")
-    mongodb_db_name = os.getenv("MONGODB_DB_NAME")
-    
-    if not mongodb_uri:
-        raise ValueError("❌ MONGODB_URI environment variable is required")
-    if not mongodb_db_name:
-        raise ValueError("❌ MONGODB_DB_NAME environment variable is required")
-    
-    for attempt in range(max_retries):
-        try:
-            print(f"🔌 Connecting to MongoDB (attempt {attempt + 1}/{max_retries})")
-            
-            # ✅ NETWORK-RESILIENT: Better settings for poor connectivity
-            client = MongoClient(
-                mongodb_uri,
-                # Connection timeouts
-                serverSelectionTimeoutMS=60000,    # 60 seconds (increased)
-                connectTimeoutMS=120000,            # 120 seconds (increased)
-                socketTimeoutMS=120000,            # 2 minutes (increased)
-                
-                # Network resilience
-                retryWrites=True,
-                retryReads=True,                   # Also retry reads
-                
-                # Read preference - allow secondary reads
-                readPreference='secondaryPreferred',  # Use secondary if primary fails
-                
-                # Connection pool
-                maxPoolSize=5,                     # Reduced pool size
-                minPoolSize=1,
-                maxIdleTimeMS=300000,              # 5 minutes
-                
-                # TLS/SSL settings for Atlas
-                tls=True,
-                tlsAllowInvalidCertificates=False,
-                
-                # Heartbeat settings
-                heartbeatFrequencyMS=30000,        # 30 seconds
-                
-                # Write concern
-                w='majority',
-                journal=True
-            )
-            
-            # Test connection with longer timeout
-            print("🔄 Testing connection...")
-            client.admin.command('ping', maxTimeMS=60000)
-            
-            # Test database access
-            db = client[mongodb_db_name]
-            db.command('ping')
-            
-            print(f"✅ MongoDB connected successfully!")
-            print(f"📊 Server info: {client.server_info()['version']}")
-            
-            return client, db
-            
-        except Exception as e:
-            print(f"❌ MongoDB connection failed (attempt {attempt + 1}): {e}")
-            
-            if attempt < max_retries - 1:
-                print(f"⏳ Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-            else:
-                print(f"💥 All {max_retries} connection attempts failed!")
-                
-                # ✅ PROVIDE TROUBLESHOOTING INFO
-                print("\n🔧 TROUBLESHOOTING TIPS:")
-                print("1. Check your internet connection")
-                print("2. Verify MongoDB Atlas cluster is running")
-                print("3. Check firewall/antivirus blocking port 27017")
-                print("4. Try connecting from MongoDB Compass")
-                print("5. Verify your IP is whitelisted in Atlas")
-                
-                raise ConnectionFailure(f"Could not connect to MongoDB after {max_retries} attempts")
-
-# ✅ Connect with retry
-try:
-    client, db = connect_to_mongodb()
-    parent_jobs_collection = db["parent_jobs"]
-    child_jobs_collection = db["child_jobs"]
-except Exception as e:
-    print(f"💥 CRITICAL: Cannot start application without MongoDB: {e}")
-    exit(1)  # Exit if we can't connect
-
 
 
 API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 # ScrapingBee endpoint
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
 
+# File system paths
+RESULTS_DIR = Path("results")
+RESULTS_DIR.mkdir(exist_ok=True)
 
-def simple_db_retry(operation, max_retries=3):
-    """Simple retry for transient MongoDB issues - NO connection recreation"""
-    for attempt in range(max_retries):
-        try:
-            return operation()
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise e
-            time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+# for thread locking (prevent concurrent modifications in parent json)
+parent_job_lock = threading.Lock()
 
-def save_completed_job_locally(job_id, job_data):
-    """Save completed job result to local file temporarily"""
-    try:
-        temp_file = TEMP_RESULTS_DIR / f"{job_id}.json"
-        
-        # Add completion timestamp
-        job_data['local_saved_at'] = time.time()
-        
-        with open(temp_file, 'w', encoding='utf-8') as f:
-            json.dump(job_data, f, indent=2, default=str)
-        
-        print(f"💾 Saved job {job_id} to local storage: {temp_file}")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Failed to save job {job_id} locally: {e}")
-        return False
-
-def get_local_completed_jobs():
-    """Get list of all locally stored completed jobs"""
-    try:
-        completed_files = list(TEMP_RESULTS_DIR.glob("*.json"))
-        return [f.stem for f in completed_files]  # Return job IDs (filenames without .json)
-    except Exception as e:
-        print(f"❌ Error reading local completed jobs: {e}")
-        return []
-
-def load_completed_job_from_local(job_id):
-    """Load a completed job from local storage"""
-    try:
-        temp_file = TEMP_RESULTS_DIR / f"{job_id}.json"
-        
-        if not temp_file.exists():
-            return None
-        
-        with open(temp_file, 'r', encoding='utf-8') as f:
-            job_data = json.load(f)
-        
-        return job_data
-        
-    except Exception as e:
-        print(f"❌ Failed to load job {job_id} from local storage: {e}")
-        return None
-
-def delete_local_completed_job(job_id):
-    """Delete completed job from local storage after MongoDB update"""
-    try:
-        temp_file = TEMP_RESULTS_DIR / f"{job_id}.json"
-        
-        if temp_file.exists():
-            temp_file.unlink()
-            print(f"🗑️ Deleted local file: {temp_file}")
-            return True
-        
-        return False
-        
-    except Exception as e:
-        print(f"❌ Failed to delete local job {job_id}: {e}")
-        return False
-
-def batch_update_mongodb():
-    """Update MongoDB with completed jobs when we have enough batched"""
-    try:
-        local_jobs = get_local_completed_jobs()
-        
-        if len(local_jobs) < BATCH_SIZE:
-            print(f"📊 Local completed jobs: {len(local_jobs)}/{BATCH_SIZE} - waiting for more")
-            return False
-        
-        print(f"🚀 BATCH UPDATE: Processing {len(local_jobs)} completed jobs to MongoDB")
-        
-        # Take the first BATCH_SIZE jobs for processing
-        jobs_to_process = local_jobs[:BATCH_SIZE]
-        successful_updates = []
-        failed_updates = []
-        
-        for job_id in jobs_to_process:
-            try:
-                # Load job data from local storage
-                job_data = load_completed_job_from_local(job_id)
-                
-                if not job_data:
-                    print(f"❌ Could not load job {job_id} from local storage")
-                    failed_updates.append(job_id)
-                    continue
-                
-                # Update MongoDB with completed job
-                def _update_job_in_mongodb():
-                    return child_jobs_collection.update_one(
-                        {"job_id": job_id},
-                        {"$set": {
-                            "status": job_data['status'],
-                            "completed_at": job_data['completed_at'],
-                            "result": job_data['result'],
-                            "credits_used": job_data['credits_used'],
-                            "processing_duration": job_data['processing_duration'],
-                            "batch_updated_at": time.time()  # Track when batch update happened
-                        }}
-                    )
-                
-                update_result = simple_db_retry(_update_job_in_mongodb)  # ✅ NEW METHOD
-                
-                if update_result.modified_count > 0:
-                    # Successfully updated MongoDB, delete local file
-                    if delete_local_completed_job(job_id):
-                        successful_updates.append(job_id)
-                        print(f"✅ Batch updated job {job_id} to MongoDB")
-                    else:
-                        print(f"⚠️ Updated MongoDB but failed to delete local file for {job_id}")
-                        successful_updates.append(job_id)
-                else:
-                    print(f"⚠️ No MongoDB update for job {job_id} (job may not exist)")
-                    failed_updates.append(job_id)
-                
-            except Exception as e:
-                print(f"❌ Failed to batch update job {job_id}: {e}")
-                failed_updates.append(job_id)
-        
-        print(f"📊 BATCH UPDATE COMPLETE:")
-        print(f"   ✅ Successful: {len(successful_updates)} jobs")
-        print(f"   ❌ Failed: {len(failed_updates)} jobs")
-        
-        if successful_updates:
-            # ✅ REMOVED: Don't call check_parent_completions here to avoid recursion
-            # The parent completion check will happen in the main worker loop
-            pass
-        
-        return len(successful_updates) > 0
-        
-    except Exception as e:
-        print(f"❌ Error in batch_update_mongodb: {e}")
-        return False
-    
-def force_batch_update_mongodb():
-    """Force update MongoDB with ALL completed jobs regardless of batch size"""
-    try:
-        local_jobs = get_local_completed_jobs()
-        
-        if len(local_jobs) == 0:
-            print(f"📊 No local completed jobs to update")
-            return False
-        
-        print(f"🚀 FORCE BATCH UPDATE: Processing {len(local_jobs)} completed jobs to MongoDB")
-        
-        # Process ALL jobs, not just BATCH_SIZE
-        successful_updates = []
-        failed_updates = []
-        
-        for job_id in local_jobs:
-            try:
-                # Load job data from local storage
-                job_data = load_completed_job_from_local(job_id)
-                
-                if not job_data:
-                    print(f"❌ Could not load job {job_id} from local storage")
-                    failed_updates.append(job_id)
-                    continue
-                
-                # Update MongoDB with completed job
-                def _update_job_in_mongodb():
-                    return child_jobs_collection.update_one(
-                        {"job_id": job_id},
-                        {"$set": {
-                            "status": job_data['status'],
-                            "completed_at": job_data['completed_at'],
-                            "result": job_data['result'],
-                            "credits_used": job_data['credits_used'],
-                            "processing_duration": job_data['processing_duration'],
-                            "force_updated_at": time.time()  # Track forced update
-                        }}
-                    )
-                
-                update_result = simple_db_retry(_update_job_in_mongodb)  # ✅ NEW METHOD
-                
-                if update_result.modified_count > 0:
-                    # Successfully updated MongoDB, delete local file
-                    if delete_local_completed_job(job_id):
-                        successful_updates.append(job_id)
-                        print(f"✅ Force updated job {job_id} to MongoDB")
-                    else:
-                        print(f"⚠️ Updated MongoDB but failed to delete local file for {job_id}")
-                        successful_updates.append(job_id)
-                else:
-                    print(f"⚠️ No MongoDB update for job {job_id} (job may not exist)")
-                    failed_updates.append(job_id)
-                
-            except Exception as e:
-                print(f"❌ Failed to force update job {job_id}: {e}")
-                failed_updates.append(job_id)
-        
-        print(f"📊 FORCE BATCH UPDATE COMPLETE:")
-        print(f"   ✅ Successful: {len(successful_updates)} jobs")
-        print(f"   ❌ Failed: {len(failed_updates)} jobs")
-        
-        return len(successful_updates) > 0
-        
-    except Exception as e:
-        print(f"❌ Error in force_batch_update_mongodb: {e}")
-        return False
+# In-memory processing queue
+processing_jobs = {}  # Jobs being processed
+request_queue = queue.Queue()
+MAX_CONCURRENT_REQUESTS = 10
+worker_running = False
 
 def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false', max_retries=1):
     """
@@ -351,11 +56,11 @@ def scrape_complete_homepage(url, use_js_render='true', use_premium_proxy='false
     # Retry loop - try up to max_retries times
     for attempt in range(max_retries):
         try:
-            # Extended timeout: 60s connect, 160s read (3 minutes 40 sec total)
+            # Extended timeout: 60s connect, 240s read (4 minutes total)
             response = requests.get(
                 SCRAPINGBEE_URL, 
                 params=params,
-                timeout=(60, 160)
+                timeout=(60, 240)
             )
 
             # 🚨 CHECK FOR 404/400 ERRORS - IMMEDIATE SKIP
@@ -883,22 +588,100 @@ def format_to_single_key(data):
     # Join all content with newlines
     complete_content = "\n".join(page_content).strip()
     
-    # ✅ CHANGED: Return in your expected API format
+    # Return in single key format
     return {
         "page_content": complete_content,
         "metadata": {
             "url": data.get('url', ''),
-            "extraction_method": "manual_parsing",
-            "retry_info": {
-                "attempts_made": 1,
-                "successful": True
-            },
-            "credits_used": data.get('credits_used', 1)
-        },
-        "success": True
+            "extraction_method": data.get('extraction_method', 'unknown'),
+            "retry_info": data.get('retry_info', {}),
+            "credits_used": data.get('credits_used', 0)
+        }
     }
                                                                                                                                                
+def handle_job_timeout(job_id):
+    """Handle a job that timed out"""
+    try:
+        if job_id in processing_jobs:
+            job = processing_jobs[job_id]
+            timeout_result = {
+                'url': job['url'],
+                'js_render': job['js_render'],
+                'premium_proxy': job['premium_proxy'],
+                'status': 'timeout',
+                'submitted_at': job['submitted_at'],
+                'completed_at': time.time(),
+                'result': {
+                    "error": "Job timed out - took too long to complete (exceeded 5 minutes)",
+                    "timeout": True,
+                    "timeout_duration": "5 minutes",
+                    "retry_info": {
+                        "max_retries_attempted": True,
+                        "note": "URL was retried 3 times before final timeout"
+                    }
+                },
+                'credits_used': 0  # Don't charge for timeouts
+            }
+            
+            # Handle parent job reference
+            parent_job_id = job.get('parent_job_id')
+            if parent_job_id:
+                timeout_result['parent_job_id'] = parent_job_id
+            
+            # Save timeout result
+            save_job_result(job_id, timeout_result)
+            
+            # Update parent job if applicable
+            if parent_job_id:
+                update_child_job_status(parent_job_id, job_id, 'timeout')
+                check_parent_job_completion(parent_job_id)
+            
+            # Remove from processing
+            del processing_jobs[job_id]
+            print(f"✅ Timeout handled for job: {job_id}")
+    
+    except Exception as e:
+        print(f"Error handling timeout for job {job_id}: {str(e)}")
 
+def handle_job_error(job_id, error_message):
+    """Handle a job that failed with an error (after retries)"""
+    try:
+        if job_id in processing_jobs:
+            job = processing_jobs[job_id]
+            error_result = {
+                'url': job['url'],
+                'js_render': job['js_render'],
+                'premium_proxy': job['premium_proxy'],
+                'status': 'error',
+                'submitted_at': job['submitted_at'],
+                'completed_at': time.time(),
+                'result': {
+                    "error": error_message,
+                    "retry_info": {
+                        "note": "Failed after multiple retry attempts"
+                    }
+                },
+                'credits_used': 0  # Don't charge for errors after retries
+            }
+            
+            # Handle parent job reference
+            parent_job_id = job.get('parent_job_id')
+            if parent_job_id:
+                error_result['parent_job_id'] = parent_job_id
+            
+            # Save error result
+            save_job_result(job_id, error_result)
+            
+            # Update parent job if applicable
+            if parent_job_id:
+                update_child_job_status(parent_job_id, job_id, 'error')
+                check_parent_job_completion(parent_job_id)
+            
+            # Remove from processing
+            del processing_jobs[job_id]
+    
+    except Exception as e:
+        print(f"Error handling job error for {job_id}: {str(e)}")
 
 def calculate_credits(js_render, premium_proxy):
     """Calculate the credit cost based on the configuration"""
@@ -915,939 +698,837 @@ def calculate_credits(js_render, premium_proxy):
     else:
         return 1  # Base cost
 
-
-def normalize_url(url):
-    """Normalize URL by adding protocol if missing"""
-    if not url:
-        return url
-    
-    url = url.strip()
-    if not url.startswith(('http://', 'https://')):
-        url = f"https://{url}"  # ✅ NO trailing slash
-    
-    return url
-
-#JOB UNIQUENESS
-def check_job_id_exists(job_id):
-    """
-    Check if a job_id already exists in either parent_jobs or child_jobs collection
-    Returns: (exists: bool, location: str, details: dict)
-    """
+def save_job_result(job_id, job_data):
+    """Save job result to a file"""
     try:
-        # Check in parent_jobs collection
-        parent_job = simple_db_retry(lambda: parent_jobs_collection.find_one(
-            {"job_id": job_id}, 
-            {"job_id": 1, "status": 1, "submitted_at": 1, "total_urls": 1}
-        ))
-        
-        if parent_job:
-            return True, "parent_jobs", {
-                "job_id": job_id,
-                "status": parent_job.get("status"),
-                "submitted_at": parent_job.get("submitted_at"),
-                "type": "parent_job",
-                "total_urls": parent_job.get("total_urls", 0)
-            }
-        
-        # Check in child_jobs collection
-        child_job = simple_db_retry(lambda: child_jobs_collection.find_one(
-            {"job_id": job_id}, 
-            {"job_id": 1, "status": 1, "submitted_at": 1, "url": 1, "parent_job_id": 1}
-        ))
-        
-        if child_job:
-            return True, "child_jobs", {
-                "job_id": job_id,
-                "status": child_job.get("status"),
-                "submitted_at": child_job.get("submitted_at"),
-                "type": "child_job",
-                "url": child_job.get("url"),
-                "parent_job_id": child_job.get("parent_job_id")
-            }
-        
-        # Job ID doesn't exist
-        return False, None, None
-        
+        file_path = RESULTS_DIR / f"{job_id}.json"
+        with open(file_path, 'w') as f:
+            json.dump(job_data, f)
+        return True
     except Exception as e:
-        print(f"❌ Error checking job_id existence: {str(e)}")
-        # In case of error, assume it exists to be safe
-        return True, "error", {"error": str(e)}
+        print(f"Error saving job result: {str(e)}")
+        return False
 
-def validate_job_id_unique(job_id, job_type="single"):
-    """
-    Validate that a job_id is unique and return appropriate error response if not
-    Returns: (is_valid: bool, error_response: dict or None)
-    """
-    if not job_id:
-        return True, None  # No job_id provided, will be auto-generated
-    
-    exists, location, details = check_job_id_exists(job_id)
-    
-    if not exists:
-        return True, None  # Job ID is unique, good to go
-    
-    # Job ID already exists, create error response
-    if location == "error":
-        error_response = {
-            "error": f"Unable to validate job_id '{job_id}' due to database error",
-            "details": details,
-            "suggestion": "Try again with a different job_id or let the system auto-generate one"
-        }
-        return False, error_response
-    
-    # Format error message based on existing job type
-    existing_type = details.get("type", "unknown")
-    existing_status = details.get("status", "unknown")
-    
-    if existing_type == "parent_job":
-        error_message = f"Job ID '{job_id}' already exists as a multi-domain job with status '{existing_status}'"
-        if details.get("total_urls"):
-            error_message += f" (processing {details['total_urls']} URLs)"
-    else:
-        error_message = f"Job ID '{job_id}' already exists as a single job with status '{existing_status}'"
-        if details.get("url"):
-            error_message += f" for URL: {details['url']}"
-    
-    error_response = {
-        "error": error_message,
-        "existing_job": details,
-        "suggestion": f"Use a different job_id or check the status of existing job at /api/status?job_id={job_id}"
-    }
-    
-    return False, error_response  
-#JOB UNIQUENESS END  
-# ✅ NEW ENDPOINT: Check if job_id is available
-@app.route('/api/check_job_id', methods=['GET'])
-def check_job_id_availability():
-    """Check if a job_id is available for use"""
+# Modify the get_job_result function to not delete the file after reading
+def get_job_result(job_id):
+    """Get job result from file without deleting it"""
     try:
-        job_id = request.args.get('job_id')
+        file_path = RESULTS_DIR / f"{job_id}.json"
+        if not file_path.exists():
+            return None
         
-        if not job_id:
-            return jsonify({"error": "job_id parameter is required"}), 400
+        with open(file_path, 'r') as f:
+            data = json.load(f)
         
-        exists, location, details = check_job_id_exists(job_id)
+        # Remove the file_path.unlink() line to keep the file
         
-        if not exists:
-            return jsonify({
-                "job_id": job_id,
-                "available": True,
-                "message": f"Job ID '{job_id}' is available for use"
-            })
-        else:
-            return jsonify({
-                "job_id": job_id,
-                "available": False,
-                "message": f"Job ID '{job_id}' already exists",
-                "existing_job": details,
-                "location": location
-            })
-            
+        return data
     except Exception as e:
-        print(f"❌ ERROR in check_job_id_availability: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-def check_parent_completions():
-    """Check all active parent jobs for completion"""
-    try:
-        # Get all active parent jobs
-        active_parents = parent_jobs_collection.find({"status": {"$ne": "completed"}})
+        print(f"Error reading job result: {str(e)}")
+        return None
+    
+def worker():
+    """Background worker to process queued requests in batches of 5"""
+    global worker_running
+    worker_running = True
+    
+    while worker_running:
+        try:
+            # Clean old results (older than 24 hours)
+            clean_old_results()
+            
+            # Get up to 5 jobs from the queue
+            batch = []
+            for _ in range(MAX_CONCURRENT_REQUESTS):
+                try:
+                    job_id = request_queue.get(block=True, timeout=1)
+                    if job_id in processing_jobs:
+                        batch.append(job_id)
+                    request_queue.task_done()
+                except queue.Empty:
+                    break
+            
+            if not batch:
+                continue
+            
+            print(f"🔄 Processing batch of {len(batch)} jobs with 5-minute per-URL timeout...")
+            
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = {
+                    executor.submit(process_job, job_id): job_id 
+                    for job_id in batch
+                }
+                
+                completed_futures = []
+                
+                # Wait for futures to complete - no batch timeout, only individual URL timeouts
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        # 5-minute timeout for individual job result
+                        future.result(timeout=20 * 60)  # 5 minutes per URL
+                        completed_futures.append(future)
+                        job_id = futures[future]
+                        print(f"✅ Job {job_id} completed successfully")
+                        
+                    except concurrent.futures.TimeoutError:
+                        job_id = futures[future]
+                        print(f"⏰ Job {job_id} timed out after 5 minutes!")
+                        handle_job_timeout(job_id)
+                        
+                    except Exception as e:
+                        job_id = futures[future]
+                        print(f"❌ Job {job_id} failed with error: {str(e)}")
+                        handle_job_error(job_id, str(e))
         
-        for parent in active_parents:
-            parent_job_id = parent["job_id"]
-            
-            # Count child job statuses
-            total_children = child_jobs_collection.count_documents({
-                "parent_job_id": parent_job_id
-            })
-            
-            completed_children = child_jobs_collection.count_documents({
-                "parent_job_id": parent_job_id,
-                "status": "completed"
-            })
-            
-            error_children = child_jobs_collection.count_documents({
-                "parent_job_id": parent_job_id,
-                "status": "error"
-            })
-            
-            processing_children = child_jobs_collection.count_documents({
-                "parent_job_id": parent_job_id,
-                "status": "processing"
-            })
-            
-            # ✅ NEW: If no jobs are processing and we have local jobs, force update
-            if processing_children == 0:
-                local_jobs = get_local_completed_jobs()
-                if len(local_jobs) > 0:
-                    print(f"🎯 No more jobs processing for {parent_job_id}, forcing update of {len(local_jobs)} local jobs")
-                    force_batch_update_mongodb()
-                    
-                    # Recalculate after forced update
-                    completed_children = child_jobs_collection.count_documents({
-                        "parent_job_id": parent_job_id,
-                        "status": "completed"
-                    })
-                    
-                    error_children = child_jobs_collection.count_documents({
-                        "parent_job_id": parent_job_id,
-                        "status": "error"
-                    })
-            
-            # ✅ ADD SAFETY CHECK: Only proceed if we have children and all are done
-            if total_children > 0 and (completed_children + error_children) == total_children:
-                
-                completion_time = time.time()
-                total_duration = completion_time - parent.get('submission_start_time', completion_time)
-                
-                # Calculate total credits properly from all child jobs
-                child_results = child_jobs_collection.find({"parent_job_id": parent_job_id})
-                total_credits = 0
-                for child in child_results:
-                    total_credits += child.get('credits_used', 0)
-                
-                # Update parent as completed in MongoDB
-                parent_jobs_collection.update_one(
-                    {"job_id": parent_job_id},
-                    {"$set": {
-                        "status": "completed",
-                        "completed_at": completion_time,
-                        "total_duration_seconds": round(total_duration, 2),
-                        "summary": {
-                            "total_jobs": total_children,
-                            "successful": completed_children,
-                            "errors": error_children,
-                            "total_credits_used": total_credits
-                        }
-                    }}
-                )
-                
-                print(f"🎯 PARENT JOB COMPLETED: {parent_job_id}")
-                print(f"   ⏱️ Total time: {total_duration:.2f} seconds")
-                print(f"   ✅ Successful: {completed_children}/{total_children}")
-                print(f"   💰 Credits used: {total_credits}")
-                
-    except Exception as e:
-        print(f"❌ Error checking parent completions: {str(e)}")
-
+        except Exception as e:
+            print(f"Worker error: {str(e)}")
+            time.sleep(1)
 
 @app.route('/api/multiple_domains', methods=['GET'])
 def submit_multiple_domains_job():
-    """Submit multiple domain scraping job - Database Queue Approach"""
+    """Submit multiple domain scraping job - FIXED VERSION"""
     try:
-        submission_start_time = time.time()
-        
-        raw_urls = request.args.getlist('url')
+        urls = request.args.getlist('url')
         js_render = request.args.get('js_render', 'false')
         premium_proxy = request.args.get('premium_proxy', 'false')
         parent_job_id = request.args.get('job_id')
         
-        if not raw_urls:
+        if not urls:
             return jsonify({"error": "No URLs provided"}), 400
         
-        # ✅ VALIDATE JOB ID UNIQUENESS
-        if parent_job_id:
-            is_valid, error_response = validate_job_id_unique(parent_job_id, "multi-domain")
-            if not is_valid:
-                print(f"❌ DUPLICATE JOB ID REJECTED: {parent_job_id}")
-                return jsonify(error_response), 409  # 409 Conflict
-        else:
+        if not parent_job_id:
             parent_job_id = f"multi_{int(time.time())}"
         
-        # ✅ NORMALIZE URLs - add protocols if missing
-        urls = []
-        invalid_urls = []
-        
-        for raw_url in raw_urls:
-            try:
-                normalized_url = normalize_url(raw_url)
-                if normalized_url:
-                    urls.append(normalized_url)
-                    print(f"📝 Normalized: {raw_url} → {normalized_url}")
-                else:
-                    invalid_urls.append(raw_url)
-            except Exception as e:
-                print(f"❌ Invalid URL: {raw_url} - {e}")
-                invalid_urls.append(raw_url)
-        
-        if not urls:
-            return jsonify({"error": "No valid URLs provided after normalization"}), 400
-        
-        if invalid_urls:
-            print(f"⚠️ Skipped {len(invalid_urls)} invalid URLs: {invalid_urls}")
-        
-        print(f"🎯 MULTI-DOMAIN JOB STARTED: {parent_job_id} with {len(urls)} valid URLs")
-        
-        # ✅ Calculate deletion time (24 hours from now)
-        delete_at = datetime.now(timezone.utc) + timedelta(hours=24)
-        
-        # Create parent job in MongoDB
-        parent_job = {
-            "job_id": parent_job_id,
-            "status": "queued",
-            "total_urls": len(urls),
-            "js_render": js_render,
-            "premium_proxy": premium_proxy,
-            "submitted_at": time.time(),
-            "submission_start_time": submission_start_time,
-            "estimated_credits": calculate_credits(js_render, premium_proxy) * len(urls),
-            "delete_at": delete_at,
-            "original_urls": raw_urls,      # ✅ Keep track of original URLs
-            "normalized_urls": urls,        # ✅ Keep track of normalized URLs
-            "invalid_urls": invalid_urls    # ✅ Keep track of invalid URLs
+        # Create a tracker file for this multi-domain job
+        tracker = {
+            'parent_job_id': parent_job_id,
+            'status': 'queued',
+            'urls': urls,
+            'url_count': len(urls),
+            'js_render': js_render,
+            'premium_proxy': premium_proxy,
+            'child_jobs': [],
+            'submitted_at': time.time(),
+            'started_at': time.time(),
+            'completed_at': None,
+            'estimated_credits': calculate_credits(js_render, premium_proxy) * len(urls)
         }
-        parent_jobs_collection.insert_one(parent_job)
-        print(f"📝 Created parent job: {parent_job_id}")
         
-        # ✅ Save ALL child jobs to MongoDB with proper queue priority
-        child_job_ids = []
+        # Ensure the directory exists and write the file properly
+        RESULTS_DIR.mkdir(exist_ok=True)
+        tracker_file_path = RESULTS_DIR / f"{parent_job_id}.json"
+        
+        # Write the tracker file with error handling
+        try:
+            with open(tracker_file_path, 'w') as f:
+                json.dump(tracker, f, indent=2)
+        except Exception as e:
+            return jsonify({"error": f"Failed to create job tracker: {str(e)}"}), 500
+        
+        # Verify the file was written correctly
+        if not tracker_file_path.exists() or tracker_file_path.stat().st_size == 0:
+            return jsonify({"error": "Failed to create job tracker file"}), 500
+        
+        # Create child jobs
+        child_jobs = []
         for i, url in enumerate(urls):
             child_job_id = f"{parent_job_id}_url{i}"
-            
-            # ✅ VALIDATE CHILD JOB ID UNIQUENESS (should not happen but be safe)
-            child_exists, _, _ = check_job_id_exists(child_job_id)
-            if child_exists:
-                # Generate alternative child job ID
-                child_job_id = f"{parent_job_id}_url{i}_{int(time.time())}"
-                print(f"⚠️ Child job ID conflict resolved: using {child_job_id}")
-            
             child_job = {
-                "job_id": child_job_id,
-                "parent_job_id": parent_job_id,
-                "url": url,  # ✅ Now using normalized URL with https://
-                "js_render": js_render,
-                "premium_proxy": premium_proxy,
-                "status": "queued",
-                "queue_priority": i,
-                "submitted_at": time.time(),
-                "processing_started_at": None,
-                "completed_at": None,
-                "result": None,
-                "credits_used": 0,
-                "retry_count": 0,
-                "job_type": "multi-domain",
-                "delete_at": delete_at
+                'job_id': child_job_id,
+                'url': url,
+                'js_render': js_render,
+                'premium_proxy': premium_proxy,
+                'status': 'queued',
+                'submitted_at': time.time(),
+                'parent_job_id': parent_job_id
             }
-            
-            child_jobs_collection.insert_one(child_job)
-            child_job_ids.append(child_job_id)
+            child_jobs.append(child_job)
         
-        submission_end_time = time.time()
-        submission_duration = submission_end_time - submission_start_time
+        # Update tracker with child jobs
+        tracker['child_jobs'] = child_jobs
         
-        print(f"📋 Saved {len(child_job_ids)} jobs to MongoDB queue with priorities 0-{len(urls)-1}")
-        print(f"🕒 SUBMISSION TIME: {submission_duration:.3f} seconds for {len(urls)} URLs")
+        # Update the tracker file with child jobs
+        try:
+            with open(tracker_file_path, 'w') as f:
+                json.dump(tracker, f, indent=2)
+        except Exception as e:
+            return jsonify({"error": f"Failed to update job tracker: {str(e)}"}), 500
         
+        # ✅ FIXED: Just add jobs to the queue, don't wait for them to complete
+        for child_job in child_jobs:
+            # Add to processing jobs
+            processing_jobs[child_job['job_id']] = child_job
+            # Add to the request queue for the worker to process
+            request_queue.put(child_job['job_id'])
+        
+        # ✅ Return immediately after queuing all jobs
         return jsonify({
             "message": f"Multi-domain job {parent_job_id} submitted successfully",
             "parent_job_id": parent_job_id,
             "total_urls": len(urls),
-            "valid_urls": len(urls),
-            "invalid_urls": len(invalid_urls),
-            "child_job_ids": child_job_ids,
-            "estimated_credits": parent_job["estimated_credits"],
+            "estimated_credits": tracker['estimated_credits'],
             "status": "queued",
-            "submission_time_seconds": round(submission_duration, 3),
-            "processing_order": f"url0 -> url1 -> ... -> url{len(urls)-1}",
-            "auto_delete_at": delete_at.isoformat(),
-            "url_normalization": {
-                "original_urls": raw_urls,
-                "normalized_urls": urls,
-                "invalid_urls": invalid_urls
-            }
+            "note": f"All {len(urls)} URLs have been queued for processing. Use /api/status?job_id={parent_job_id} to check progress."
         })
         
     except Exception as e:
-        print(f"❌ ERROR in submit_multiple_domains_job: {str(e)}")
         return jsonify({"error": str(e)}), 500
-    
-def database_worker():
-    """Simple continuous processing with file cleanup when idle"""
-    print("🚀 Database worker started")
-    
-    max_concurrent = 10
-    executor = ThreadPoolExecutor(max_workers=max_concurrent)
-    active_futures = {}
-    
-    while worker_running:
-        try:
-            # Fill available slots with queued jobs
-            while len(active_futures) < max_concurrent and worker_running:
-                # ✅ SIMPLE RETRY - no function wrapper
-                job = simple_db_retry(lambda: child_jobs_collection.find_one_and_update(
-                    {"status": "queued"},
-                    {"$set": {
-                        "status": "processing",
-                        "processing_started_at": time.time(),
-                        "worker_claimed_at": time.time()
-                    }},
-                    sort=[("submitted_at", 1), ("queue_priority", 1), ("job_id", 1)]
-                ))
-                
-                if not job:
-                    break
-                
-                future = executor.submit(process_database_job, job["job_id"])
-                active_futures[future] = job["job_id"]
-                print(f"🎬 Started job {job['job_id']} (slot {len(active_futures)}/{max_concurrent})")
-            
-            # Check for completed jobs
-            if active_futures:
-                completed_futures = []
-                for future in list(active_futures.keys()):
-                    if future.done():
-                        completed_futures.append(future)
-                
-                for future in completed_futures:
-                    job_id = active_futures[future]
-                    try:
-                        future.result()
-                        print(f"✅ Completed job {job_id} - slot freed ({len(active_futures)-1}/{max_concurrent})")
-                    except Exception as e:
-                        print(f"❌ Job {job_id} failed: {str(e)}")
-                        # ✅ SIMPLE RETRY
-                        simple_db_retry(lambda: child_jobs_collection.update_one(
-                            {"job_id": job_id},
-                            {"$set": {
-                                "status": "error",
-                                "completed_at": time.time(),
-                                "result": {"error": f"Job execution failed: {str(e)}"}
-                            }}
-                        ))
-                    
-                    del active_futures[future]
-                
-                if completed_futures:
-                    # ✅ SIMPLE CALL - no retry wrapper
-                    check_parent_completions()
-            
-            # Cleanup when idle
-            if len(active_futures) == 0:
-                local_jobs = get_local_completed_jobs()
-                if len(local_jobs) > 0:
-                    print(f"🧹 No jobs running - cleaning up {len(local_jobs)} local files")
-                    force_batch_update_mongodb()
-                    check_parent_completions()
-            
-            # Sleep based on activity
-            time.sleep(0.1 if len(active_futures) > 0 else 1)
-                
-        except Exception as e:
-            print(f"❌ Database worker error: {str(e)}")
-            time.sleep(5)  # Simple fixed delay
-    
-    # Cleanup
-    executor.shutdown(wait=True)
-    print("🛑 Database worker stopped")
-
-
-def process_database_job(job_id, max_retries=2):
-    """Process a single job - minimal retry logic"""
+def process_job(job_id, max_job_retries=2):
+    """Process a single job with retry logic at the job level - 2 job attempts, 1 URL attempt each"""
     try:
-        print(f"🚀 STARTING DATABASE JOB: {job_id}")
-        
-        # ✅ SIMPLE RETRY
-        job = simple_db_retry(lambda: child_jobs_collection.find_one({"job_id": job_id}))
-        
-        if not job:
-            print(f"❌ Job {job_id} not found in database")
+        if job_id not in processing_jobs:
             return
+            
+        job = processing_jobs[job_id]
+        job['status'] = 'processing'
         
+        # Update parent job if this is a child job
+        parent_job_id = job.get('parent_job_id')
+        if parent_job_id:
+            update_child_job_status(parent_job_id, job_id, 'processing')
+        
+        last_error = None
         job_start_time = time.time()
         
-        # Job-level retry loop
-        for attempt in range(max_retries):
+        # Job-level retry loop - try the entire scraping job 2 times
+        for job_attempt in range(max_job_retries):
             try:
-                print(f"🔄 Job attempt {attempt + 1}/{max_retries} for {job_id}")
+                attempt_start_time = time.time()
                 
-                # ✅ SIMPLE UPDATE
-                simple_db_retry(lambda: child_jobs_collection.update_one(
-                    {"job_id": job_id},
-                    {"$set": {"retry_count": attempt + 1}}
-                ))
-                
-                # Call scraping function
+                # Call the scraping function (1 URL attempt per job attempt)
                 result = scrape_complete_homepage(
-                    job['url'],
-                    job['js_render'],
+                    job['url'], 
+                    job['js_render'], 
                     job['premium_proxy'],
                     max_retries=1
                 )
                 
-                # Handle successful result
+                # Check if scraping was successful
                 if isinstance(result, dict) and result.get('success'):
-                    job_end_time = time.time()
-                    total_duration = job_end_time - job_start_time
+                    # Get credits from result if available
+                    credit_cost = result.get('credits_used', calculate_credits(job['js_render'], job['premium_proxy']))
                     
-                    print(f"✅ JOB COMPLETED: {job_id} ({total_duration:.2f}s) - saving locally")
-                    
-                    credits_used = result.get('credits_used', calculate_credits(job['js_render'], job['premium_proxy']))
-                    
-                    completed_job_data = {
-                        "job_id": job_id,
-                        "status": "completed",
-                        "completed_at": job_end_time,
-                        "result": result,
-                        "credits_used": credits_used,
-                        "processing_duration": total_duration,
-                        "url": job['url'],
-                        "js_render": job['js_render'],
-                        "premium_proxy": job['premium_proxy'],
-                        "parent_job_id": job.get('parent_job_id')
-                    }
-                    
-                    # Save locally and trigger batch update
-                    if save_completed_job_locally(job_id, completed_job_data):
-                        batch_update_mongodb()
-                    else:
-                        # ✅ FALLBACK - simple retry
-                        simple_db_retry(lambda: child_jobs_collection.update_one(
-                            {"job_id": job_id},
-                            {"$set": {
-                                "status": "completed",
-                                "completed_at": job_end_time,
-                                "result": result,
-                                "credits_used": credits_used,
-                                "processing_duration": total_duration
-                            }}
-                        ))
-                    
-                    return
-                
-                # Handle skip errors
-                elif isinstance(result, dict) and result.get('skip_retry'):
-                    job_end_time = time.time()
-                    print(f"🚫 JOB SKIPPED: {job_id} - {result.get('error_type')} - saving locally")
-                    
-                    credits_used = result.get('credits_used', calculate_credits(job['js_render'], job['premium_proxy']))
-                    
-                    completed_job_data = {
-                        "job_id": job_id,
-                        "status": "error",
-                        "completed_at": job_end_time,
-                        "result": result,
-                        "credits_used": credits_used,
-                        "processing_duration": job_end_time - job_start_time,
-                        "url": job['url'],
-                        "js_render": job['js_render'],
-                        "premium_proxy": job['premium_proxy'],
-                        "parent_job_id": job.get('parent_job_id')
-                    }
-                    
-                    if save_completed_job_locally(job_id, completed_job_data):
-                        batch_update_mongodb()
-                    else:
-                        # ✅ FALLBACK - simple retry
-                        simple_db_retry(lambda: child_jobs_collection.update_one(
-                            {"job_id": job_id},
-                            {"$set": {
-                                "status": "error",
-                                "completed_at": job_end_time,
-                                "result": result,
-                                "credits_used": credits_used,
-                                "processing_duration": job_end_time - job_start_time
-                            }}
-                        ))
-                    
-                    return
-                
-                # Retry for other errors
-                else:
-                    error_msg = result.get('error', 'Unknown error') if isinstance(result, dict) else str(result)
-                    print(f"❌ Job attempt {attempt + 1} failed for {job_id}: {error_msg}")
-                    
-                    if attempt == max_retries - 1:
-                        # Final failure
-                        job_end_time = time.time()
-                        credits_used = 0
-                        
-                        completed_job_data = {
-                            "job_id": job_id,
-                            "status": "error",
-                            "completed_at": job_end_time,
-                            "result": {"error": f"Failed after {max_retries} attempts: {error_msg}"},
-                            "credits_used": credits_used,
-                            "processing_duration": job_end_time - job_start_time,
-                            "url": job['url'],
-                            "js_render": job['js_render'],
-                            "premium_proxy": job['premium_proxy'],
-                            "parent_job_id": job.get('parent_job_id')
+                    # Create a completed job entry
+                    completed_job = {
+                        'url': job['url'],
+                        'js_render': job['js_render'],
+                        'premium_proxy': job['premium_proxy'],
+                        'status': 'completed',
+                        'submitted_at': job['submitted_at'],
+                        'completed_at': time.time(),
+                        'result': result,
+                        'credits_used': credit_cost,
+                        'job_retry_info': {
+                            'job_attempts_made': job_attempt + 1,
+                            'job_successful': True
                         }
-                        
-                        if save_completed_job_locally(job_id, completed_job_data):
-                            batch_update_mongodb()
-                        else:
-                            # ✅ FALLBACK - simple retry
-                            simple_db_retry(lambda: child_jobs_collection.update_one(
-                                {"job_id": job_id},
-                                {"$set": {
-                                    "status": "error",
-                                    "completed_at": job_end_time,
-                                    "result": {"error": f"Failed after {max_retries} attempts: {error_msg}"},
-                                    "credits_used": credits_used,
-                                    "processing_duration": job_end_time - job_start_time
-                                }}
-                            ))
-                        break
-                    else:
-                        time.sleep(attempt + 1)
-                        
-            except Exception as e:
-                print(f"💥 Job {job_id} attempt {attempt + 1} exception: {str(e)}")
-                
-                if attempt == max_retries - 1:
-                    job_end_time = time.time()
-                    
-                    completed_job_data = {
-                        "job_id": job_id,
-                        "status": "error",
-                        "completed_at": job_end_time,
-                        "result": {"error": f"Exception after {max_retries} attempts: {str(e)}"},
-                        "credits_used": 0,
-                        "processing_duration": job_end_time - job_start_time,
-                        "url": job.get('url', ''),
-                        "js_render": job.get('js_render', 'false'),
-                        "premium_proxy": job.get('premium_proxy', 'false'),
-                        "parent_job_id": job.get('parent_job_id')
                     }
                     
-                    if save_completed_job_locally(job_id, completed_job_data):
-                        batch_update_mongodb()
-                    else:
-                        # ✅ FALLBACK - simple retry
-                        simple_db_retry(lambda: child_jobs_collection.update_one(
-                            {"job_id": job_id},
-                            {"$set": {
-                                "status": "error",
-                                "completed_at": job_end_time,
-                                "result": {"error": f"Exception after {max_retries} attempts: {str(e)}"},
-                                "credits_used": 0,
-                                "processing_duration": job_end_time - job_start_time
-                            }}
-                        ))
-                else:
-                    time.sleep(attempt + 1)
+                    # If this is a child job, add parent reference
+                    if parent_job_id:
+                        completed_job['parent_job_id'] = parent_job_id
                     
+                    # Save to file system
+                    save_job_result(job_id, completed_job)
+                    
+                    # Update parent job if this is a child job
+                    if parent_job_id:
+                        update_child_job_status(parent_job_id, job_id, 'completed')
+                    
+                    # Remove from processing queue
+                    if job_id in processing_jobs:
+                        del processing_jobs[job_id]
+                    
+                    return  # Exit function on success
+                
+                # Check for immediate skip errors (404/400)
+                elif isinstance(result, dict) and result.get('skip_retry'):
+                    total_job_time = time.time() - job_start_time
+                    
+                    # Save result with error details
+                    job_result = {
+                        'job_id': job_id,
+                        'url': job['url'],
+                        'js_render': job['js_render'],
+                        'premium_proxy': job['premium_proxy'],
+                        'status': 'error',
+                        'submitted_at': job['submitted_at'],
+                        'completed_at': time.time(),
+                        'result': {
+                            'error': result.get('error'),
+                            'error_type': result.get('error_type'),
+                            'skipped_due_to_client_error': True
+                        },
+                        'credits_used': result.get('credits_used', 1),
+                        'total_time': total_job_time,
+                        'job_attempts': job_attempt + 1,
+                        'job_retry_info': {
+                            'job_attempts_made': job_attempt + 1,
+                            'job_successful': False,
+                            'skipped_immediately': True
+                        }
+                    }
+                    
+                    # If this is a child job, add parent reference
+                    if parent_job_id:
+                        job_result['parent_job_id'] = parent_job_id
+                    
+                    # Save to file system
+                    save_job_result(job_id, job_result)
+                    
+                    # Update parent job if this is a child job
+                    if parent_job_id:
+                        update_child_job_status(parent_job_id, job_id, 'error')
+                    
+                    # Remove from processing queue
+                    if job_id in processing_jobs:
+                        del processing_jobs[job_id]
+                    
+                    return  # Exit immediately, no more job attempts
+                
+                # Other errors (will retry)
+                else:
+                    error_msg = result.get('error', 'Unknown scraping error') if isinstance(result, dict) else str(result)
+                    last_error = {
+                        "job_attempt": job_attempt + 1,
+                        "error": error_msg,
+                        "result": result,
+                        "attempt_duration": time.time() - attempt_start_time
+                    }
+                    
+                    # If it's the last attempt, break and handle error
+                    if job_attempt == max_job_retries - 1:
+                        break
+                    
+                    # Wait before retry
+                    wait_time = job_attempt + 1
+                    time.sleep(wait_time)
+                    
+            except Exception as job_error:
+                error_msg = f"Job attempt {job_attempt + 1} exception: {str(job_error)}"
+                
+                last_error = {
+                    "job_attempt": job_attempt + 1,
+                    "error": error_msg,
+                    "exception": str(job_error),
+                    "attempt_duration": time.time() - attempt_start_time
+                }
+                
+                # If it's the last attempt, break and handle error
+                if job_attempt == max_job_retries - 1:
+                    break
+                
+                # Wait before retry
+                wait_time = job_attempt + 1
+                time.sleep(wait_time)
+        
+        # All job attempts failed - create error result
+        error_result = {
+            'url': job['url'],
+            'js_render': job['js_render'],
+            'premium_proxy': job['premium_proxy'],
+            'status': 'error',
+            'submitted_at': job['submitted_at'],
+            'completed_at': time.time(),
+            'result': {
+                "error": f"Job failed after {max_job_retries} attempts",
+                "last_error": last_error,
+                "job_retry_info": {
+                    "job_attempts_made": max_job_retries,
+                    "job_successful": False,
+                    "final_error": "max_job_retries_exceeded"
+                }
+            },
+            'credits_used': 0  # Don't charge for failed jobs
+        }
+        
+        # If this is a child job, add parent reference
+        if parent_job_id:
+            error_result['parent_job_id'] = parent_job_id
+        
+        # Save error result
+        save_job_result(job_id, error_result)
+        
+        # Update parent job if this is a child job
+        if parent_job_id:
+            update_child_job_status(parent_job_id, job_id, 'error')
+        
+        # Remove from processing
+        if job_id in processing_jobs:
+            del processing_jobs[job_id]
+            
     except Exception as e:
-        print(f"💥 Critical error in process_database_job {job_id}: {str(e)}")
-        # Handle critical error with simple retry
-        simple_db_retry(lambda: child_jobs_collection.update_one(
-            {"job_id": job_id},
-            {"$set": {
-                "status": "error",
-                "completed_at": time.time(),
-                "result": {"error": f"Critical error: {str(e)}"},
-                "credits_used": 0,
-                "processing_duration": 0
-            }}
-        ))
+        if job_id in processing_jobs:
+            del processing_jobs[job_id]
 
+
+def update_child_job_status(parent_job_id, child_job_id, status):
+    """Update the status of a child job in the parent tracker with simple threading lock"""
+    try:
+        file_path = RESULTS_DIR / f"{parent_job_id}.json"
+        if not file_path.exists():
+            return
+        
+        # Use simple threading lock to prevent concurrent writes
+        with parent_job_lock:
+            # Read current content
+            with open(file_path, 'r') as f:
+                content = f.read()
+            
+            if not content.strip():
+                return
+            
+            try:
+                parent_job = json.loads(content)
+            except json.JSONDecodeError as e:
+                return
+            
+            # Update child job status
+            updated = False
+            for child in parent_job.get('child_jobs', []):
+                if child.get('job_id') == child_job_id:
+                    child['status'] = status
+                    updated = True
+                    break
+            
+            if not updated:
+                return
+            
+            # Write back to file
+            with open(file_path, 'w') as f:
+                json.dump(parent_job, f, indent=2)
+            
+            # Check completion after updating (while still holding the lock)
+            check_parent_job_completion_locked(parent_job_id)
+        
+    except Exception as e:
+        pass
+
+def check_parent_job_completion_locked(parent_job_id):
+    """Check completion while already holding the lock - INTERNAL USE ONLY"""
+    try:
+        file_path = RESULTS_DIR / f"{parent_job_id}.json"
+        if not file_path.exists():
+            return
+        
+        # Read current content (lock already held by caller)
+        with open(file_path, 'r') as f:
+            content = f.read()
+        
+        if not content.strip():
+            return
+        
+        try:
+            parent_job = json.loads(content)
+        except json.JSONDecodeError as e:
+            return
+        
+        # Check if already completed
+        if parent_job.get('status') == 'completed':
+            return
+        
+        # Check if all child jobs are completed, error, or timeout
+        all_completed = True
+        for child in parent_job.get('child_jobs', []):
+            if child.get('status') not in ['completed', 'error', 'timeout']:
+                all_completed = False
+                break
+        
+        # If all completed, update parent job status
+        if all_completed:
+            completion_time = time.time()
+            parent_job['status'] = 'completed'
+            parent_job['completed_at'] = completion_time
+            
+            # Add timing to parent job data
+            if 'started_at' in parent_job:
+                total_duration = completion_time - parent_job['started_at']
+                parent_job['timing'] = {
+                    'total_duration_seconds': round(total_duration, 2),
+                    'average_per_url_seconds': round(total_duration / parent_job['url_count'], 2)
+                }
+            
+            # Collect results from all child jobs
+            results = {}
+            total_credits = 0
+            timeout_count = 0
+            error_count = 0
+            success_count = 0
+            
+            for child in parent_job.get('child_jobs', []):
+                child_job_id = child.get('job_id')
+                child_url = child.get('url')
+                
+                # Get child job result
+                child_result = get_job_result(child_job_id)
+                if child_result:
+                    status = child_result.get('status')
+                    results[child_url] = {
+                        'status': status,
+                        'result': child_result.get('result'),
+                        'credits_used': child_result.get('credits_used', 0)
+                    }
+                    total_credits += child_result.get('credits_used', 0)
+                    
+                    # Count status types
+                    if status == 'completed':
+                        success_count += 1
+                    elif status == 'timeout':
+                        timeout_count += 1
+                    elif status == 'error':
+                        error_count += 1
+            
+            # Add results and summary to parent job
+            parent_job['results'] = results
+            parent_job['total_credits_used'] = total_credits
+            parent_job['summary'] = {
+                'total_urls': len(parent_job.get('child_jobs', [])),
+                'successful': success_count,
+                'timeouts': timeout_count,
+                'errors': error_count
+            }
+            
+            # Write back to file
+            with open(file_path, 'w') as f:
+                json.dump(parent_job, f, indent=2)
+            
+    except Exception as e:
+        pass
+
+# Keep the old function for external calls (but make it use the lock)
+def check_parent_job_completion(parent_job_id):
+    """Public function to check parent job completion with locking"""
+    with parent_job_lock:
+        check_parent_job_completion_locked(parent_job_id)
+
+def clean_old_results():
+    """Clean results older than 24 hours"""
+    try:
+        current_time = time.time()
+        one_day_ago = current_time - (24*60*60)
+        
+        for file_path in RESULTS_DIR.glob("*.json"):
+            # Get file modification time
+            file_mtime = file_path.stat().st_mtime
+            if file_mtime < one_day_ago:
+                file_path.unlink()
+    except Exception as e:
+        print(f"Error cleaning old results: {str(e)}")
 
 @app.route('/api/submit', methods=['GET'])
 def submit_job():
-    """Submit a single URL scraping job with TTL"""
-    try:
-        submission_start_time = time.time()
-        
-        # Get parameters
-        raw_url = request.args.get('url')
-        js_render = request.args.get('js_render', 'false')
-        premium_proxy = request.args.get('premium_proxy', 'false')
-        job_id = request.args.get('job_id')
-        
-        if not raw_url:
-            return jsonify({"error": "URL parameter is required"}), 400
-        
-        # ✅ VALIDATE JOB ID UNIQUENESS
-        if job_id:
-            is_valid, error_response = validate_job_id_unique(job_id, "single")
-            if not is_valid:
-                print(f"❌ DUPLICATE JOB ID REJECTED: {job_id}")
-                return jsonify(error_response), 409  # 409 Conflict
-        else:
-            job_id = f"single_{int(time.time())}"
-        
-        # ✅ NORMALIZE URL
-        url = normalize_url(raw_url)
-        print(f"📝 Normalized: {raw_url} → {url}")
-        
-        print(f"🎯 SINGLE JOB SUBMITTED: {job_id} for URL: {url}")
-        
-        # ✅ Calculate deletion time (24 hours from now)
-        delete_at = datetime.now(timezone.utc) + timedelta(hours=24)
-        
-        single_job = {
-            "job_id": job_id,
-            "parent_job_id": None,
-            "url": url,  # ✅ Using normalized URL
-            "js_render": js_render,
-            "premium_proxy": premium_proxy,
-            "status": "queued",
-            "queue_priority": 0,
-            "submitted_at": time.time(),
-            "processing_started_at": None,
-            "completed_at": None,
-            "result": None,
-            "credits_used": 0,
-            "retry_count": 0,
-            "job_type": "single",
-            "delete_at": delete_at
-        }
-        
-        simple_db_retry(lambda: child_jobs_collection.insert_one(single_job))
-        
-        submission_end_time = time.time()
-        submission_duration = submission_end_time - submission_start_time
-        
-        print(f"📋 Single job {job_id} added to MongoDB queue (auto-delete: {delete_at})")
-        print(f"🕒 SUBMISSION TIME: {submission_duration:.3f} seconds")
-        
-        return jsonify({
-            "job_id": job_id,
-            "message": f"Job queued. Check status at /api/status?job_id={job_id}",
-            "status": "queued",
-            "url": url,  # ✅ Return normalized URL
-            "original_url": raw_url,  # ✅ Show original URL too
-            "auto_delete_at": delete_at.isoformat()
-        })
-        
-    except Exception as e:
-        print(f"❌ ERROR in submit_job: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-
-
-@app.route('/api/queue', methods=['GET'])
-def get_queue_info():
-    """Get information about the current job queue - matches previous API format"""
-    try:
-        # Count jobs by status
-        queued_jobs = child_jobs_collection.count_documents({"status": "queued"})
-        processing_jobs = child_jobs_collection.count_documents({"status": "processing"})
-        completed_jobs = child_jobs_collection.count_documents({"status": "completed"})
-        
-        # Get completed job IDs
-        completed_job_docs = child_jobs_collection.find(
-            {"status": "completed"}, 
-            {"job_id": 1}
-        )
-        completed_job_ids = [job["job_id"] for job in completed_job_docs]
-        
-        # Get processing jobs details
-        processing_job_docs = child_jobs_collection.find(
-            {"status": "processing"}, 
-            {"job_id": 1, "url": 1, "processing_started_at": 1}
-        )
-        processing_jobs_list = {}
-        for job in processing_job_docs:
-            processing_jobs_list[job["job_id"]] = {
-                "url": job["url"],
-                "processing_started_at": job.get("processing_started_at")
-            }
-        
-        # Format response to match your previous API
-        return jsonify({
-            "queue_size": queued_jobs,
-            "processing_jobs": processing_jobs,
-            "completed_jobs": completed_jobs,
-            "completed_job_ids": completed_job_ids,
-            "processing_jobs_list": processing_jobs_list,
-            "status_counts": {
-                "queued": queued_jobs,
-                "processing": processing_jobs,
-                "completed": completed_jobs
-            }
-        })
-        
-    except Exception as e:
-        print(f"❌ ERROR in get_queue_info: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+    """Submit a new scraping job to the queue"""
+    url = request.args.get('url')
+    js_render = request.args.get('js_render', 'true')
+    premium_proxy = request.args.get('premium_proxy', 'false')
+    job_id = request.args.get('job_id')
     
+    if not url:
+        return jsonify({"error": "No URL provided. Use '?url=example.com' parameter"}), 400
+        
+    if not job_id:
+        # Generate a timestamp-based ID if not provided
+        job_id = f"job_{int(time.time() * 1000)}"
+                                     
+    # Check if job_id already exists in processing or file system
+    if job_id in processing_jobs or (RESULTS_DIR / f"{job_id}.json").exists():
+        return jsonify({"error": f"Job ID '{job_id}' already exists. Please use a unique job ID"}), 400
+        
+    # Add http:// prefix if not present
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    # Create a new job and add to processing queue
+    processing_jobs[job_id] = {
+        'url': url,
+        'js_render': js_render,
+        'premium_proxy': premium_proxy,
+        'status': 'queued',
+        'submitted_at': time.time(),
+        'completed_at': None,
+        'credits_used': calculate_credits(js_render, premium_proxy)
+    }
+    
+    # Add to queue
+    request_queue.put(job_id)
+    
+    return jsonify({
+        "job_id": job_id,
+        "status": "queued",
+        "url": url,
+        "message": f"Job queued. Check status at /api/status?job_id={job_id}"
+    })
 
 @app.route('/api/status', methods=['GET'])
 def get_job_status():
-    """Get the status or result of a job by ID - matches previous API format"""
+    """Get the status or result of a job by ID"""
+    job_id = request.args.get('job_id')
+    
+    if not job_id:
+        return jsonify({"error": "No job_id provided. Use '?job_id=YOUR_JOB_ID' parameter"}), 400
+    
+    # First check if job is in processing queue
+    if job_id in processing_jobs:
+        job = processing_jobs[job_id]
+        return jsonify({
+            "job_id": job_id,
+            "status": job['status'],
+            "url": job.get('url', ''),
+            "submitted_at": job['submitted_at'],
+            "message": "Job is still processing..."
+        })
+    
+    # Then check in file system
+    result = get_job_result(job_id)
+    if result:
+        # Check if this is a parent job (has child_jobs field)
+        if 'child_jobs' in result:
+            # It's a multi-domain job
+            response = {
+                "job_id": job_id,
+                "status": result['status'],
+                "url_count": result.get('url_count', 0),
+                "submitted_at": result['submitted_at'],
+                "completed_at": result.get('completed_at')
+            }
+            
+            # If completed, include results and summary
+            if result['status'] == 'completed':
+                response["total_credits_used"] = result.get('total_credits_used', 0)
+                response["results"] = result.get('results', {})
+                response["summary"] = result.get('summary', {})  # ✅ Add summary with timeout info
+            else:
+                # Include progress info
+                child_statuses = {}
+                for child in result.get('child_jobs', []):
+                    child_statuses[child.get('url')] = child.get('status')
+                response["progress"] = child_statuses
+            
+            return jsonify(response)
+        else:
+            # It's a regular job
+            if result['status'] == 'completed':
+                response = {
+                    "job_id": job_id,
+                    "status": "completed",
+                    "url": result['url'],
+                    "submitted_at": result['submitted_at'],
+                    "completed_at": result['completed_at'],
+                    "credits_used": result.get('credits_used', 0),
+                    "result": result['result']
+                }
+            elif result['status'] == 'timeout':  # ✅ Handle timeout status
+                response = {
+                    "job_id": job_id,
+                    "status": "timeout",
+                    "url": result['url'],
+                    "submitted_at": result['submitted_at'],
+                    "completed_at": result['completed_at'],
+                    "timeout": result['result'],
+                    "credits_used": result.get('credits_used', 0)
+                }
+            else:  # Error status
+                response = {
+                    "job_id": job_id,
+                    "status": "error",
+                    "url": result['url'],
+                    "submitted_at": result['submitted_at'],
+                    "completed_at": result['completed_at'],
+                    "error": result['result'],
+                    "credits_used": result.get('credits_used', 0)
+                }
+            
+            return jsonify(response)
+    
+    # Job not found in either place
+    return jsonify({"error": f"Job '{job_id}' not found. It may have already been retrieved or never existed."}), 404
+
+
+@app.route('/api/queue', methods=['GET'])
+def get_queue_status():
+    """Get status of all jobs in the queue and results directory"""
+    # Count jobs in processing queue by status
+    processing_status_counts = {
+        'queued': 0,
+        'processing': 0
+    }
+    
+    for job in processing_jobs.values():
+        if job['status'] in processing_status_counts:
+            processing_status_counts[job['status']] += 1
+    
+    # Count completed jobs in file system
+    completed_count = len(list(RESULTS_DIR.glob("*.json")))
+    
+    # Combine counts
+    status_counts = {
+        'queued': processing_status_counts['queued'],
+        'processing': processing_status_counts['processing'],
+        'completed': completed_count
+    }
+    
+    return jsonify({
+        "queue_size": request_queue.qsize(),
+        "processing_jobs": len(processing_jobs),
+        "completed_jobs": completed_count,
+        "status_counts": status_counts,
+        "processing_jobs_list": {
+            job_id: {
+                "status": job["status"],
+                "url": job["url"],
+                "submitted_at": job["submitted_at"],
+                "credits_used": job.get("credits_used", 0)
+            } for job_id, job in processing_jobs.items()
+        },
+        "completed_job_ids": [file.stem for file in RESULTS_DIR.glob("*.json")]
+    })
+
+@app.route('/api/clear', methods=['GET'])
+def clear_completed():
+    """Clear all completed jobs"""
+    try:
+        completed_files = list(RESULTS_DIR.glob("*.json"))
+        count = len(completed_files)
+        
+        for file_path in completed_files:
+            file_path.unlink()
+        
+        return jsonify({
+            "message": f"Cleared {count} completed jobs",
+            "remaining_processing_jobs": len(processing_jobs)
+        })
+    except Exception as e:
+        return jsonify({
+            "error": f"Error clearing completed jobs: {str(e)}"
+        }), 500
+# Add a new endpoint to delete a specific job result by job_id
+@app.route('/api/delete', methods=['GET'])
+def delete_job_result():
+    """Delete a specific job result by job_id - handles parent/child relationships"""
     job_id = request.args.get('job_id')
     
     if not job_id:
         return jsonify({"error": "No job_id provided. Use '?job_id=YOUR_JOB_ID' parameter"}), 400
     
     try:
-        # ✅ FIXED: Check child job with simple retry
-        child_job = simple_db_retry(lambda: child_jobs_collection.find_one({"job_id": job_id}))
+        file_path = RESULTS_DIR / f"{job_id}.json"
         
-        if child_job:
-            # Format response to match your previous API
-            response_data = {
-                "job_id": job_id,
-                "status": child_job['status'],
-                "url": child_job['url'],
-                "submitted_at": child_job.get('submitted_at')
-            }
-            
-            # Add completion data if job is done
-            if child_job['status'] in ['completed', 'error']:
-                response_data.update({
-                    "completed_at": child_job.get('completed_at'),
-                    "credits_used": child_job.get('credits_used', 0)
-                })
-                
-                # Add result data if successful
-                if child_job['status'] == 'completed' and child_job.get('result'):
-                    result = child_job['result']
-                    
-                    # Format result to match your previous structure
-                    if isinstance(result, dict):
-                        response_data["result"] = result
-            
-            return jsonify(response_data)
-        
-        # ✅ FIXED: Check parent job with simple retry
-        parent_job = simple_db_retry(lambda: parent_jobs_collection.find_one({"job_id": job_id}))
-        
-        if parent_job:
-            # ✅ FIXED: Get child jobs with simple retry
-            child_jobs = simple_db_retry(lambda: list(child_jobs_collection.find({"parent_job_id": job_id})))
-            
-            response_data = {
-                "job_id": job_id,
-                "status": parent_job['status'],
-                "type": "parent_job",
-                "total_urls": parent_job.get('total_urls', 0),
-                "submitted_at": parent_job.get('submitted_at')
-            }
-            
-            if parent_job['status'] == 'completed':
-                response_data.update({
-                    "completed_at": parent_job.get('completed_at'),
-                    "summary": parent_job.get('summary', {})
-                })
-            
-            # Add child job details
-            response_data["child_jobs"] = [
-                {
-                    "job_id": child['job_id'],
-                    "url": child['url'],
-                    "status": child['status'],
-                    "completed_at": child.get('completed_at'),
-                    "credits_used": child.get('credits_used', 0)
-                }
-                for child in child_jobs
-            ]
-            
-            return jsonify(response_data)
-        
-        return jsonify({"error": "Job not found"}), 404
-        
-    except Exception as e:
-        print(f"❌ ERROR in get_job_status: {str(e)}")
-        return jsonify({"error": "Database error"}), 500
-    
-def create_database_indexes():
-    """Create indexes for better query performance"""
-    try:
-        # Existing indexes...
-        child_jobs_collection.create_index([
-            ("status", 1),
-            ("submitted_at", 1), 
-            ("queue_priority", 1),
-            ("job_id", 1)
-        ])
-        
-        # ✅ NEW: TTL Index - MongoDB will auto-delete after 24 hours
-        child_jobs_collection.create_index(
-            "delete_at", 
-            expireAfterSeconds=0  # Delete exactly at the time specified in delete_at field
-        )
-        
-        parent_jobs_collection.create_index(
-            "delete_at", 
-            expireAfterSeconds=0
-        )
-        
-        print("✅ Database indexes created successfully (including TTL)")
-    except Exception as e:
-        print(f"⚠️ Warning: Could not create indexes: {e}")
-
-
-@app.route('/api/delete', methods=['GET'])
-def delete_job_by_param():
-    """Delete a job and its result - matches previous API structure"""
-    try:
-        # Get job_id from query parameter (like your previous API)
-        job_id = request.args.get('job_id')
-        
-        if not job_id:
-            return jsonify({"error": "No job_id provided. Use '?job_id=YOUR_JOB_ID' parameter"}), 400
-        
-        # Check if it's a parent job (multi-domain job)
-        parent_job = parent_jobs_collection.find_one({"job_id": job_id})
-        
-        if parent_job:
-            # ✅ PARENT JOB DELETION
-            print(f"🗑️ Deleting parent job {job_id} and all children from database")
-            
-            # Get list of child jobs before deletion (for reporting)
-            child_jobs = list(child_jobs_collection.find({"parent_job_id": job_id}))
-            child_job_ids = [child['job_id'] for child in child_jobs]
-            
-            # Delete all child jobs from MongoDB
-            child_result = child_jobs_collection.delete_many({"parent_job_id": job_id})
-            
-            # Delete parent job from MongoDB
-            parent_result = parent_jobs_collection.delete_one({"job_id": job_id})
-            
-            print(f"📊 Deleted parent job and {child_result.deleted_count} child jobs from database")
-            
-            # ✅ MATCH YOUR EXPECTED RESPONSE FORMAT
+        if not file_path.exists():
             return jsonify({
-                "job_id": job_id,
-                "message": f"Successfully deleted parent job '{job_id}' and all child jobs",
-                "deleted_jobs": [job_id] + child_job_ids
+                "error": f"No job result found for job_id: {job_id}"
+            }), 404
+        
+        # Read the job data to determine if it's a parent or child job
+        with open(file_path, 'r') as f:
+            job_data = json.load(f)
+        
+        deleted_jobs = []
+        
+        # Check if this is a parent job (has child_jobs field)
+        if 'child_jobs' in job_data:
+            # This is a parent job - delete all child jobs first
+            child_jobs = job_data.get('child_jobs', [])
+            
+            for child in child_jobs:
+                child_job_id = child.get('job_id')
+                if child_job_id:
+                    child_file_path = RESULTS_DIR / f"{child_job_id}.json"
+                    if child_file_path.exists():
+                        child_file_path.unlink()
+                        deleted_jobs.append(child_job_id)
+            
+            # Delete the parent job
+            file_path.unlink()
+            deleted_jobs.append(job_id)
+            
+            return jsonify({
+                "message": f"Successfully deleted parent job '{job_id}' and {len(child_jobs)} child jobs",
+                "deleted_jobs": deleted_jobs,
+                "parent_job_id": job_id,
+                "child_jobs_deleted": len(child_jobs)
+            })
+        
+        # Check if this is a child job (has parent_job_id field)
+        elif 'parent_job_id' in job_data:
+            parent_job_id = job_data.get('parent_job_id')
+            
+            # Delete the child job first
+            file_path.unlink()
+            deleted_jobs.append(job_id)
+            
+            # Update the parent job to remove this child from the list
+            if parent_job_id:
+                parent_file_path = RESULTS_DIR / f"{parent_job_id}.json"
+                if parent_file_path.exists():
+                    try:
+                        with open(parent_file_path, 'r') as f:
+                            parent_data = json.load(f)
+                        
+                        # Remove this child job from the parent's child_jobs list
+                        if 'child_jobs' in parent_data:
+                            parent_data['child_jobs'] = [
+                                child for child in parent_data['child_jobs'] 
+                                if child.get('job_id') != job_id
+                            ]
+                            
+                            # Update URL count and remove from results if present
+                            if 'results' in parent_data:
+                                # Find and remove the URL from results
+                                url_to_remove = job_data.get('url')
+                                if url_to_remove and url_to_remove in parent_data['results']:
+                                    del parent_data['results'][url_to_remove]
+                            
+                            # Update counts
+                            parent_data['url_count'] = len(parent_data.get('child_jobs', []))
+                            
+                            # Recalculate total credits if needed
+                            if 'results' in parent_data:
+                                total_credits = sum(
+                                    result.get('credits_used', 0) 
+                                    for result in parent_data['results'].values()
+                                )
+                                parent_data['total_credits_used'] = total_credits
+                            
+                            # Save updated parent job
+                            with open(parent_file_path, 'w') as f:
+                                json.dump(parent_data, f)
+                    
+                    except Exception as e:
+                        print(f"Error updating parent job {parent_job_id}: {str(e)}")
+            
+            return jsonify({
+                "message": f"Successfully deleted child job '{job_id}' and updated parent job '{parent_job_id}'",
+                "deleted_jobs": deleted_jobs,
+                "child_job_id": job_id,
+                "parent_job_id": parent_job_id
             })
         
         else:
-            # ✅ CHILD JOB DELETION - Check if it's a child job
-            child_job = child_jobs_collection.find_one({"job_id": job_id})
+            # This is a standalone job (neither parent nor child)
+            file_path.unlink()
+            deleted_jobs.append(job_id)
             
-            if not child_job:
-                return jsonify({"error": "Job not found"}), 404
-            
-            # Delete the child job from MongoDB
-            child_result = child_jobs_collection.delete_one({"job_id": job_id})
-            
-            print(f"🗑️ Deleted job {job_id} from database")
-            
-            # ✅ MATCH YOUR EXPECTED RESPONSE FORMAT
             return jsonify({
-                "job_id": job_id,
                 "message": f"Successfully deleted standalone job '{job_id}'",
-                "deleted_jobs": [job_id]
+                "deleted_jobs": deleted_jobs,
+                "job_id": job_id
             })
-                
-    except Exception as e:
-        print(f"❌ Error in delete_job: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-    
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Simple health check with database ping"""
-    try:
-        # ✅ FIXED: Test database connection with simple retry
-        simple_db_retry(lambda: client.admin.command('ping'), max_retries=1)
-        
+            
+    except json.JSONDecodeError:
+        # File exists but is not valid JSON - delete it anyway
+        if file_path.exists():
+            file_path.unlink()
         return jsonify({
-            "status": "healthy",
-            "database": "connected",
-            "timestamp": time.time()
-        }), 200
+            "message": f"Deleted corrupted job file for job_id: {job_id}",
+            "deleted_jobs": [job_id],
+            "warning": "File contained invalid JSON"
+        })
         
     except Exception as e:
         return jsonify({
-            "status": "unhealthy",
-            "database": "disconnected",
-            "error": str(e)
-        }), 503
-    
+            "error": f"Error deleting job result: {str(e)}"
+        }), 500
+
 @app.route('/api/debug', methods=['GET'])
 def debug_routes():
     """Debug route to check registered routes"""
@@ -2045,20 +1726,26 @@ def home():
     </html>
     '''
 
-if __name__ == '__main__':
-    print("🚀 Starting Pure Database-Driven Scraping Service...")
-    
-    # Set worker flags
-    worker_running = True
+# Function to ensure the results directory exists at startup
+def ensure_results_dir():
+    """Ensure the results directory exists"""
+    if not RESULTS_DIR.exists():
+        RESULTS_DIR.mkdir()
 
-    # Create database indexes (will include TTL)
-    create_database_indexes()
-    
-    # Start database worker thread
-    worker_thread = threading.Thread(target=database_worker, daemon=True)
+# Start the worker thread when the app starts
+if __name__ == '__main__':
+    # Ensure results directory exists
+    ensure_results_dir()
+
+    # Start the worker thread
+    worker_thread = threading.Thread(target=worker, daemon=True)
     worker_thread.start()
-    print("✅ Database worker thread started")
-    
-    # Simple - just run Flask
-    app.run(debug=True, host='0.0.0.0', port=5000, use_reloader=False)
-    print("👋 Application stopped")
+
+    # Run the Flask app
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
+else:
+    # For when importing as a module or running with a WSGI server
+    ensure_results_dir()
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start() # type: ignore
