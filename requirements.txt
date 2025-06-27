@@ -5,3 +5,4 @@ Quart
 aiohttp
 werkzeug==2.3.7
 hypercorn
+gunicorn
