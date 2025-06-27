@@ -1,18 +1,18 @@
 import asyncio
 import aiohttp
-from quart import Quart, request as quart_request, jsonify as quart_jsonify
+from flask import Flask, request, jsonify
 from bs4 import BeautifulSoup
 import json
 import os
 import time
 from pathlib import Path
-import werkzeug
 import threading
 import signal
+# from concurrent.futures import ThreadPoolExecutor
+import functools
 
-
-# Switch to Quart for async Flask-like framework
-app = Quart(__name__)
+# Flask app setup
+app = Flask(__name__)
 
 API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
@@ -30,8 +30,35 @@ processing_jobs = {}
 MAX_CONCURRENT_REQUESTS = 10
 worker_running = False
 
-# Global aiohttp session
+# Global aiohttp session and event loop
 session = None
+loop = None
+# executor = ThreadPoolExecutor(max_workers=4)
+
+def async_route(f):
+    """Decorator to run async functions in Flask routes"""
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        # Get or create event loop for this thread
+        try:
+            current_loop = asyncio.get_event_loop()
+        except RuntimeError:
+            current_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(current_loop)
+        
+        # Run the async function
+        return current_loop.run_until_complete(f(*args, **kwargs))
+    return wrapper
+
+def run_in_background_loop(coro):
+    """Run coroutine in the background event loop"""
+    global loop
+    if loop is None or loop.is_closed():
+        return None
+    
+    # Schedule coroutine in the background loop
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future
 
 class AsyncJobManager:
     def __init__(self):
@@ -751,25 +778,39 @@ async def clean_old_results_async():
     except Exception as e:
         print(f"Error in async cleanup: {str(e)}")
 
-# ✅ ASYNC ROUTES using Quart
+def start_background_loop():
+    """Start the background event loop in a separate thread"""
+    global loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Start the async worker in the background loop
+    loop.run_until_complete(async_worker())
+
+# Start background thread for async operations
+background_thread = threading.Thread(target=start_background_loop, daemon=True)
+background_thread.start()
+
+# ✅ FLASK ROUTES
 
 @app.route('/api/submit', methods=['GET'])
+@async_route
 async def submit_job():
     """Submit a new scraping job to the async queue"""
-    url = quart_request.args.get('url')
-    js_render = quart_request.args.get('js_render', 'true')
-    premium_proxy = quart_request.args.get('premium_proxy', 'false')
-    job_id = quart_request.args.get('job_id')
+    url = request.args.get('url')
+    js_render = request.args.get('js_render', 'true')
+    premium_proxy = request.args.get('premium_proxy', 'false')
+    job_id = request.args.get('job_id')
     
     if not url:
-        return (await quart_jsonify({"error": "No URL provided. Use '?url=example.com' parameter"})), 400
+        return jsonify({"error": "No URL provided. Use '?url=example.com' parameter"}), 400
         
     if not job_id:
         job_id = f"async_job_{int(time.time() * 1000)}"
                                      
     # Check if job_id already exists
     if job_id in processing_jobs or (RESULTS_DIR / f"{job_id}.json").exists():
-        return (await quart_jsonify({"error": f"Job ID '{job_id}' already exists. Please use a unique job ID"})), 400
+        return jsonify({"error": f"Job ID '{job_id}' already exists. Please use a unique job ID"}), 400
         
     # Add https:// prefix if not present
     if not url.startswith(('http://', 'https://')):
@@ -786,10 +827,15 @@ async def submit_job():
         'credits_used': calculate_credits(js_render, premium_proxy)
     }
     
-    # Add to async queue
-    await job_queue.put(job_id)
+    # Add to async queue using background loop
+    future = run_in_background_loop(job_queue.put(job_id))
+    if future:
+        try:
+            future.result(timeout=5)  # Wait max 5 seconds for queue operation
+        except Exception as e:
+            return jsonify({"error": f"Failed to queue job: {str(e)}"}), 500
     
-    return quart_jsonify({  
+    return jsonify({  
         "job_id": job_id,
         "status": "queued",
         "url": url,
@@ -798,16 +844,17 @@ async def submit_job():
     })
 
 @app.route('/api/multiple_domains', methods=['GET'])
+@async_route
 async def submit_multiple_domains_job():
-    """Submit multiple domain scraping job - Async version"""
+    """Submit multiple domain scraping job - Flask + Async version"""
     try:
-        raw_urls = quart_request.args.getlist('url')
-        js_render = quart_request.args.get('js_render', 'false')
-        premium_proxy = quart_request.args.get('premium_proxy', 'false')
-        parent_job_id = quart_request.args.get('job_id')
+        raw_urls = request.args.getlist('url')
+        js_render = request.args.get('js_render', 'false')
+        premium_proxy = request.args.get('premium_proxy', 'false')
+        parent_job_id = request.args.get('job_id')
         
         if not raw_urls:
-            return (await quart_jsonify({"error": "No URLs provided"})), 400
+            return jsonify({"error": "No URLs provided"}), 400
         
         # Normalize URLs
         urls = []
@@ -827,10 +874,10 @@ async def submit_multiple_domains_job():
                 invalid_urls.append(raw_url)
         
         if not urls:
-            return (await quart_jsonify({"error": "No valid URLs provided after normalization"})), 400
+            return jsonify({"error": "No valid URLs provided after normalization"}), 400
         
         if not parent_job_id:
-            parent_job_id = f"async_multi_{int(time.time())}"
+            parent_job_id = f"flask_multi_{int(time.time())}"
         
         # Create parent job tracker
         tracker = {
@@ -847,7 +894,7 @@ async def submit_multiple_domains_job():
             'started_at': time.time(),
             'completed_at': None,
             'estimated_credits': calculate_credits(js_render, premium_proxy) * len(urls),
-            'processing_type': 'asynchronous'
+            'processing_type': 'flask_asynchronous'
         }
         
         # Save tracker file
@@ -878,23 +925,28 @@ async def submit_multiple_domains_job():
         with open(tracker_file_path, 'w') as f:
             json.dump(tracker, f, indent=2)
         
-        # Add jobs to async queue
+        # Add jobs to async queue using background loop
         for child_job in child_jobs:
             processing_jobs[child_job['job_id']] = child_job
-            await job_queue.put(child_job['job_id'])
+            future = run_in_background_loop(job_queue.put(child_job['job_id']))
+            if future:
+                try:
+                    future.result(timeout=1)  # Quick timeout per job
+                except Exception as e:
+                    print(f"Warning: Failed to queue child job {child_job['job_id']}: {e}")
         
-        print(f"🎯 ASYNC MULTI-DOMAIN JOB: {parent_job_id} with {len(urls)} URLs")
+        print(f"🎯 FLASK MULTI-DOMAIN JOB: {parent_job_id} with {len(urls)} URLs")
         print(f"📋 Queued {len(child_jobs)} async jobs for processing")
         
-        return quart_jsonify({
-            "message": f"Async multi-domain job {parent_job_id} submitted successfully",
+        return jsonify({
+            "message": f"Flask multi-domain job {parent_job_id} submitted successfully",
             "parent_job_id": parent_job_id,
             "total_urls": len(urls),
             "valid_urls": len(urls),
             "invalid_urls": len(invalid_urls),
             "estimated_credits": tracker['estimated_credits'],
             "status": "queued",
-            "processing_type": "asynchronous",
+            "processing_type": "flask_asynchronous",
             "url_normalization": {
                 "original_urls": raw_urls,
                 "normalized_urls": urls,
@@ -904,26 +956,26 @@ async def submit_multiple_domains_job():
         })
         
     except Exception as e:
-        return (await quart_jsonify({"error": str(e)})), 500
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/status', methods=['GET'])
-async def get_job_status():
-    """Get the status or result of a job by ID - Async version"""
-    job_id = quart_request.args.get('job_id')
+def get_job_status():
+    """Get the status or result of a job by ID - Flask version"""
+    job_id = request.args.get('job_id')
     
     if not job_id:
-        return (await quart_jsonify({"error": "No job_id provided. Use '?job_id=YOUR_JOB_ID' parameter"})), 400
+        return jsonify({"error": "No job_id provided. Use '?job_id=YOUR_JOB_ID' parameter"}), 400
     
     # First check if job is in processing queue
     if job_id in processing_jobs:
         job = processing_jobs[job_id]
-        return await quart_jsonify({
+        return jsonify({
             "job_id": job_id,
             "status": job['status'],
             "url": job.get('url', ''),
             "submitted_at": job['submitted_at'],
-            "processing_type": "asynchronous",
-            "message": "Async job is still processing..."
+            "processing_type": "flask_asynchronous",
+            "message": "Flask async job is still processing..."
         })
     
     # Check in file system
@@ -937,7 +989,7 @@ async def get_job_status():
                 "url_count": result.get('url_count', 0),
                 "submitted_at": result['submitted_at'],
                 "completed_at": result.get('completed_at'),
-                "processing_type": result.get('processing_type', 'asynchronous')
+                "processing_type": result.get('processing_type', 'flask_asynchronous')
             }
             
             if result['status'] == 'completed':
@@ -951,7 +1003,7 @@ async def get_job_status():
                     child_statuses[child.get('url')] = child.get('status')
                 response["progress"] = child_statuses
             
-            return quart_jsonify(response)
+            return jsonify(response)
         else:
             # Single job
             response = {
@@ -961,7 +1013,7 @@ async def get_job_status():
                 "submitted_at": result['submitted_at'],
                 "completed_at": result['completed_at'],
                 "credits_used": result.get('credits_used', 0),
-                "processing_type": result.get('processing_type', 'asynchronous')
+                "processing_type": result.get('processing_type', 'flask_asynchronous')
             }
             
             if result['status'] == 'completed':
@@ -971,13 +1023,13 @@ async def get_job_status():
             else:
                 response["error"] = result['result']
             
-            return quart_jsonify(response)
+            return jsonify(response)
     
-    return (await quart_jsonify({"error": f"Job '{job_id}' not found."})), 404
+    return jsonify({"error": f"Job '{job_id}' not found."}), 404
 
 @app.route('/api/queue', methods=['GET'])
-async def get_queue_status():
-    """Get async queue status"""
+def get_queue_status():
+    """Get async queue status - Flask version"""
     # Count jobs in processing queue by status
     processing_status_counts = {
         'queued': 0,
@@ -991,13 +1043,26 @@ async def get_queue_status():
     # Count completed jobs in file system
     completed_count = len(list(RESULTS_DIR.glob("*.json")))
     
-    return quart_jsonify({
-        "queue_size": job_queue.qsize(),
+    # Get queue size from background loop
+    queue_size = 0
+    if loop and not loop.is_closed():
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                asyncio.create_task(asyncio.coroutine(lambda: job_queue.qsize())()),
+                loop
+            )
+            queue_size = future.result(timeout=1)
+        except:
+            queue_size = "unavailable"
+    
+    return jsonify({
+        "queue_size": queue_size,
         "processing_jobs": len(processing_jobs),
         "completed_jobs": completed_count,
-        "active_tasks": len(job_manager.active_tasks),
+        "active_tasks": len(job_manager.active_tasks) if job_manager else 0,
         "max_concurrent": MAX_CONCURRENT_REQUESTS,
-        "processing_type": "asynchronous",
+        "processing_type": "flask_asynchronous",
+        "background_loop_status": "running" if loop and not loop.is_closed() else "stopped",
         "status_counts": {
             'queued': processing_status_counts['queued'],
             'processing': processing_status_counts['processing'],
@@ -1014,8 +1079,8 @@ async def get_queue_status():
     })
 
 @app.route('/api/clear', methods=['GET'])
-async def clear_completed():
-    """Clear all completed jobs"""
+def clear_completed():
+    """Clear all completed jobs - Flask version"""
     try:
         completed_files = list(RESULTS_DIR.glob("*.json"))
         count = len(completed_files)
@@ -1023,28 +1088,28 @@ async def clear_completed():
         for file_path in completed_files:
             file_path.unlink()
         
-        return await quart_jsonify({  # ✅ Added await
+        return jsonify({
             "message": f"Cleared {count} completed jobs",
             "remaining_processing_jobs": len(processing_jobs)
         })
     except Exception as e:
-        return (await quart_jsonify({  # ✅ Added await
+        return jsonify({
             "error": f"Error clearing completed jobs: {str(e)}"
-        })), 500
+        }), 500
 
 @app.route('/api/delete', methods=['GET'])
-async def delete_job_result():
-    """Delete a specific job result by job_id - handles parent/child relationships"""
-    job_id = quart_request.args.get('job_id')
+def delete_job_result():
+    """Delete a specific job result by job_id - Flask version"""
+    job_id = request.args.get('job_id')
     
     if not job_id:
-        return quart_jsonify({"error": "No job_id provided"}), 400  # ✅ REMOVED await
+        return jsonify({"error": "No job_id provided"}), 400
     
     try:
         file_path = RESULTS_DIR / f"{job_id}.json"
         
         if not file_path.exists():
-            return quart_jsonify({  # ✅ REMOVED await
+            return jsonify({
                 "error": f"No job result found for job_id: {job_id}"
             }), 404
         
@@ -1071,7 +1136,7 @@ async def delete_job_result():
             file_path.unlink()
             deleted_jobs.append(job_id)
             
-            return quart_jsonify({  # ✅ REMOVED await - no parentheses needed for success
+            return jsonify({
                 "message": f"Successfully deleted parent job '{job_id}' and {len(child_jobs)} child jobs",
                 "deleted_jobs": deleted_jobs,
                 "parent_job_id": job_id,
@@ -1109,7 +1174,7 @@ async def delete_job_result():
                 file_path.unlink()
                 deleted_jobs.append(job_id)
                 
-                return quart_jsonify({  # ✅ REMOVED await - no parentheses needed for success
+                return jsonify({
                     "message": f"Successfully deleted child job '{job_id}' and updated parent job '{parent_job_id}'",
                     "deleted_jobs": deleted_jobs,
                     "child_job_id": job_id,
@@ -1121,36 +1186,36 @@ async def delete_job_result():
                 file_path.unlink()
                 deleted_jobs.append(job_id)
                 
-                return quart_jsonify({  # ✅ REMOVED await - no parentheses needed for success
+                return jsonify({
                     "message": f"Successfully deleted standalone job '{job_id}'",
                     "deleted_jobs": deleted_jobs,
                     "job_id": job_id
                 })
     
     except FileNotFoundError:
-        return quart_jsonify({  # ✅ REMOVED await
+        return jsonify({
             "error": f"Job file not found: {job_id}"
         }), 404
     
     except PermissionError:
-        return quart_jsonify({  # ✅ REMOVED await
+        return jsonify({
             "error": f"Permission denied when deleting job: {job_id}"
         }), 403
     
     except json.JSONDecodeError:
-        return quart_jsonify({  # ✅ REMOVED await
+        return jsonify({
             "error": f"Invalid JSON in job file: {job_id}"
         }), 500
     
     except Exception as e:
         print(f"❌ Error in delete_job_result: {str(e)}")
-        return quart_jsonify({  # ✅ REMOVED await
+        return jsonify({
             "error": f"Error deleting job result: {str(e)}"
         }), 500
-    
+
 @app.route('/api/debug', methods=['GET'])
-async def debug_routes():
-    """Debug route to check registered routes"""
+def debug_routes():
+    """Debug route to check registered routes - Flask version"""
     routes = []
     for rule in app.url_map.iter_rules():
         routes.append({
@@ -1158,17 +1223,18 @@ async def debug_routes():
             'methods': list(rule.methods),
             'rule': rule.rule
         })
-    return quart_jsonify({"registered_routes": routes})  # ✅ Added await
+    return jsonify({"registered_routes": routes})
 
 @app.route('/api/scrape', methods=['GET'])
+@async_route
 async def direct_scrape():
-    """Direct scraping endpoint (legacy) - Async version"""
-    url = quart_request.args.get('url')
-    js_render = quart_request.args.get('js_render', 'true')
-    premium_proxy = quart_request.args.get('premium_proxy', 'false')
+    """Direct scraping endpoint (legacy) - Flask + Async version"""
+    url = request.args.get('url')
+    js_render = request.args.get('js_render', 'true')
+    premium_proxy = request.args.get('premium_proxy', 'false')
     
     if not url:
-        return (await quart_jsonify({"error": "No URL provided"})), 400  # ✅ Added await
+        return jsonify({"error": "No URL provided"}), 400
     
     # Add https:// prefix if not present
     if not url.startswith(('http://', 'https://')):
@@ -1179,38 +1245,39 @@ async def direct_scrape():
         result = await scrape_complete_homepage_async(url, js_render, premium_proxy)
         
         if result.get('success'):
-            return quart_jsonify({ 
+            return jsonify({ 
                 "status": "completed",
                 "url": url,
                 "result": result,
                 "credits_used": result.get('credits_used', 0),
-                "processing_type": "direct_async"
+                "processing_type": "direct_flask_async"
             })
         else:
-            return (await quart_jsonify({  # ✅ Added await
+            return jsonify({
                 "status": "error",
                 "url": url,
                 "error": result,
                 "credits_used": result.get('credits_used', 0)
-            })), 500
+            }), 500
             
     except Exception as e:
-        return (await quart_jsonify({  # ✅ Added await
+        return jsonify({
             "status": "error",
             "url": url,
             "error": str(e)
-        })), 500
+        }), 500
 
 @app.route('/', methods=['GET'])
-async def home():
-    """Async home page"""
+def home():
+    """Flask home page"""
     return '''
     <html>
         <head>
-            <title>Async Parallel Web Scraper API</title>
+            <title>Flask + Asyncio Web Scraper API</title>
             <style>
                 body { font-family: Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 20px; }
                 .highlight { background-color: #e7f3ff; padding: 10px; border-left: 4px solid #2196F3; margin: 10px 0; }
+                .warning { background-color: #fff3cd; padding: 10px; border-left: 4px solid #ffc107; margin: 10px 0; }
                 code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
                 table { border-collapse: collapse; width: 100%; margin: 20px 0; }
                 th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
@@ -1218,16 +1285,26 @@ async def home():
             </style>
         </head>
         <body>
-            <h1>🚀 Async Parallel Web Scraper API</h1>
+            <h1>🚀 Flask + Asyncio Web Scraper API</h1>
             
             <div class="highlight">
-                <strong>⚡ NEW: Asynchronous Processing!</strong><br>
-                This API now uses <code>asyncio</code> and <code>aiohttp</code> for efficient concurrent processing without threads.
+                <strong>⚡ Flask + Async Architecture!</strong><br>
+                This API combines Flask's familiar routing with asyncio for efficient concurrent processing.
                 <ul>
-                    <li>✅ More efficient resource usage</li>
-                    <li>✅ Better scalability under load</li>
-                    <li>✅ Non-blocking HTTP requests</li>
-                    <li>✅ Event-loop based concurrency</li>
+                    <li>✅ Flask routes for familiar development experience</li>
+                    <li>✅ Asyncio background worker for concurrent scraping</li>
+                    <li>✅ Non-blocking HTTP requests with aiohttp</li>
+                    <li>✅ Thread-safe communication between Flask and async worker</li>
+                </ul>
+            </div>
+            
+            <div class="warning">
+                <strong>⚠️ Architecture Notes:</strong><br>
+                <ul>
+                    <li>Flask routes handle HTTP requests synchronously</li>
+                    <li>Background thread runs asyncio event loop</li>
+                    <li>Jobs are queued and processed asynchronously</li>
+                    <li>Results are stored in files for retrieval</li>
                 </ul>
             </div>
             
@@ -1245,21 +1322,25 @@ async def home():
             <h3>4. Queue Status</h3>
             <code>GET /api/queue</code>
             
-            <h2>🎯 Performance Improvements</h2>
+            <h3>5. Direct Scrape (No Queue)</h3>
+            <code>GET /api/scrape?url=example.com&js_render=true</code>
+            
+            <h2>🏗️ Architecture Comparison</h2>
             <table>
-                <tr><th>Aspect</th><th>Before (Threads)</th><th>After (Async)</th></tr>
-                <tr><td>Memory Usage</td><td>~8MB per thread</td><td>~8KB per task</td></tr>
-                <tr><td>CPU Overhead</td><td>Context switching</td><td>Event loop</td></tr>
-                <tr><td>Scalability</td><td>Limited by threads</td><td>Limited by memory</td></tr>
-                <tr><td>I/O Blocking</td><td>Thread blocks</td><td>Non-blocking</td></tr>
+                <tr><th>Aspect</th><th>Pure Flask</th><th>Flask + Asyncio</th><th>Pure Quart</th></tr>
+                <tr><td>Route Handling</td><td>Synchronous</td><td>Sync + Async Decorator</td><td>Native Async</td></tr>
+                <tr><td>Background Jobs</td><td>Threads/Celery</td><td>Asyncio Worker</td><td>Native Async</td></tr>
+                <tr><td>Learning Curve</td><td>Easy</td><td>Medium</td><td>Medium</td></tr>
+                <tr><td>Performance</td><td>Limited</td><td>High for I/O</td><td>Highest</td></tr>
+                <tr><td>Ecosystem</td><td>Largest</td><td>Flask + Asyncio</td><td>Growing</td></tr>
             </table>
             
-            <p><strong>🔥 Up to 1000x more efficient for I/O-bound tasks!</strong></p>
+            <p><strong>🎯 This approach gives you Flask familiarity with asyncio performance!</strong></p>
         </body>
     </html>
     '''
 
-# Keep the sync utility functions
+# Utility functions (keeping sync versions)
 def calculate_credits(js_render, premium_proxy):
     """Calculate the credit cost based on the configuration"""
     js = js_render.lower() == 'true'
@@ -1276,8 +1357,7 @@ def calculate_credits(js_render, premium_proxy):
         return 1
 
 def format_to_single_key(data):
-    """Format structured data into a single key - keeping existing function"""
-    # Your existing format_to_single_key implementation
+    """Format structured data into a single key"""
     page_content = []
     
     # Add page title
@@ -1326,14 +1406,14 @@ def format_to_single_key(data):
         "page_content": complete_content,
         "metadata": {
             "url": data.get('url', ''),
-            "extraction_method": data.get('extraction_method', 'async_parsing'),
+            "extraction_method": data.get('extraction_method', 'flask_async_parsing'),
             "retry_info": data.get('retry_info', {}),
             "credits_used": data.get('credits_used', 0)
         }
     }
 
 def get_job_result(job_id):
-    """Get job result from file - keeping sync for file operations"""
+    """Get job result from file"""
     try:
         file_path = RESULTS_DIR / f"{job_id}.json"
         if not file_path.exists():
@@ -1354,51 +1434,40 @@ async def cleanup_session():
         await session.close()
         print("🔗 Closed aiohttp session")
 
-async def startup_async_worker():
-    """Start the async worker"""
-    # Create the async worker task
-    worker_task = asyncio.create_task(async_worker())
-    
-    # Setup graceful shutdown
-    def signal_handler(signum, frame):
-        global worker_running
-        print(f"\n🛑 Received signal {signum}, shutting down...")
-        worker_running = False
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    try:
-        await worker_task
-    except Exception as e:
-        print(f"Worker task error: {e}")
-    finally:
-        await cleanup_session()
-
 if __name__ == '__main__':
     # Ensure results directory exists
     RESULTS_DIR.mkdir(exist_ok=True)
     
-    # Development mode only
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    async def run_app():
-        # Start worker
-        worker_task = asyncio.create_task(async_worker())
+    # Set up graceful shutdown
+    def signal_handler(signum, frame):
+        global worker_running
+        print(f"\n🛑 Received signal {signum}, shutting down...")
+        worker_running = False
         
-        # Run Quart app
-        port = int(os.environ.get('PORT', 8080))
-        await app.run_task(host='0.0.0.0', port=port, debug=True)
+        # Cleanup session in background loop
+        if loop and not loop.is_closed():
+            asyncio.run_coroutine_threadsafe(cleanup_session(), loop)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Give background thread time to start
+    time.sleep(2)
+    
+    # Run Flask app
+    port = int(os.environ.get('PORT', 8080))
+    print(f"🌶️ Starting Flask app on port {port}")
+    print("🔄 Background asyncio worker should be running...")
     
     try:
-        loop.run_until_complete(run_app())
+        app.run(host='0.0.0.0', port=port, debug=True, threaded=True)
     except KeyboardInterrupt:
-        print("\n🛑 Development shutdown...")
+        print("\n🛑 Flask shutdown...")
     finally:
-        if not loop.is_closed():
-            loop.run_until_complete(cleanup_session())
-            loop.close()
+        worker_running = False
+        if loop and not loop.is_closed():
+            # Try to cleanup gracefully
+            try:
+                asyncio.run_coroutine_threadsafe(cleanup_session(), loop).result(timeout=5)
+            except:
+                pass
