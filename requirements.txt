@@ -3,6 +3,5 @@ requests==2.31.0
 beautifulsoup4==4.12.2
 Quart
 aiohttp
-werkzeug
+werkzeug==2.3.7
 hypercorn
-gunicorn
